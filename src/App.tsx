@@ -32,6 +32,7 @@ function App() {
   const [includeSubtitles, setIncludeSubtitles] = useState(true);
   const [outputDir, setOutputDir] = useState("");
   const [query, setQuery] = useState("");
+  const [qrImage, setQrImage] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [tasks, setTasks] = useState<Record<string, DownloadProgress>>({});
@@ -39,10 +40,14 @@ function App() {
   useEffect(() => {
     let stopAuth: (() => void) | undefined;
     let stopProgress: (() => void) | undefined;
+    let stopQr: (() => void) | undefined;
     void listen<AuthStatus>("auth-status", (event) => {
       setAuth(event.payload);
       if (event.payload.phase === "authorized") void refreshCourses();
     }).then((unlisten) => (stopAuth = unlisten));
+    void listen<string>("qr-code-update", (event) => {
+      setQrImage(event.payload);
+    }).then((unlisten) => (stopQr = unlisten));
     void listen<DownloadProgress>("download-progress", (event) => {
       const update = event.payload;
       setTasks((current) => ({ ...current, [update.taskId]: update }));
@@ -51,6 +56,7 @@ function App() {
     return () => {
       stopAuth?.();
       stopProgress?.();
+      stopQr?.();
     };
   }, []);
 
@@ -70,12 +76,22 @@ function App() {
 
   const openLogin = async () => {
     setError("");
-    setAuth({ phase: "canvas-login", message: "正在打开扫码登录窗口" });
+    setQrImage("");
+    setAuth({ phase: "qr-login", message: "正在获取二维码…" });
     try {
       await invoke("open_login");
     } catch (reason) {
       setError(String(reason));
-      setAuth({ phase: "error", message: "登录窗口打开失败" });
+      setAuth({ phase: "error", message: "登录启动失败" });
+    }
+  };
+
+  const refreshQrCode = async () => {
+    setError("");
+    try {
+      await invoke("refresh_qr_code");
+    } catch (reason) {
+      setError(String(reason));
     }
   };
 
@@ -149,6 +165,7 @@ function App() {
   const logout = async () => {
     await invoke("logout");
     setAuth({ phase: "idle", message: "尚未连接 Canvas" });
+    setQrImage("");
     setCourses([]);
     setLessons([]);
     setCourse(null);
@@ -209,9 +226,20 @@ function App() {
               <div className="hero-number">01</div>
               <p>只使用交我办扫码</p>
               <h2>不输入密码，<br />也不保存密码。</h2>
-              <p className="muted">登录窗口会自动进入 jAccount，并隐藏账号密码与短信入口。扫码完成后，课程会在这里出现。</p>
+              <p className="muted">登录流程与 sjtu-canvas-video-download 一致：先进入 jAccount，再用交我办扫码。扫码完成后，课程会在这里出现。</p>
+              <div className="qr-panel">
+                {qrImage ? (
+                  <img className="qr-image" src={`data:image/png;base64,${qrImage}`} alt="交我办扫码登录" onClick={refreshQrCode} />
+                ) : (
+                  <div className="qr-placeholder">{auth.phase === "qr-login" ? "正在加载二维码…" : "点击下方按钮开始扫码"}</div>
+                )}
+                {qrImage && <small>点击二维码可刷新</small>}
+              </div>
               <div className="hero-actions">
-                <button className="primary-button" onClick={openLogin}>打开扫码登录</button>
+                <button className="primary-button" onClick={openLogin}>
+                  {auth.phase === "qr-login" ? "重新获取二维码" : "开始扫码登录"}
+                </button>
+                {qrImage && <button className="text-button" onClick={refreshQrCode}>刷新二维码</button>}
                 {auth.phase === "authorized" && <button className="text-button" onClick={refreshCourses}>刷新课程</button>}
               </div>
             </div>

@@ -1,85 +1,31 @@
+mod auth;
+
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::StreamExt;
-use reqwest::{Client, StatusCode, header, multipart};
+use reqwest::{Client, StatusCode, cookie::Jar, header, multipart};
+use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::{Emitter, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
+use tauri::{Emitter, Manager};
 use tokio::{fs, io::AsyncWriteExt, sync::Semaphore};
 use url::Url;
 
-const CANVAS_ORIGIN: &str = "https://oc.sjtu.edu.cn";
-const VIDEO_ORIGIN: &str = "https://v.sjtu.edu.cn";
-const VIDEO_API: &str = "https://v.sjtu.edu.cn/jy-application-canvas-sjtu";
+use auth::{QrLoginController, client_with_jar, spawn_qr_login};
 
-const LOGIN_SCRIPT: &str = r#"
-(() => {
-  if (window.top !== window) return;
-  let clickedJaccount = false;
-  let observer;
-  const text = (node) => (node?.innerText || node?.textContent || node?.value || '').replace(/\s+/g, ' ').trim();
-  const hide = (node) => {
-    if (!node) return;
-    node.style.setProperty('display', 'none', 'important');
-    node.setAttribute('aria-hidden', 'true');
-  };
-  const clickable = () => [...document.querySelectorAll('a,button,input[type="button"],input[type="submit"]')];
-  const tick = () => {
-    const host = location.hostname;
-    if (host === 'oc.sjtu.edu.cn') {
-      const isLogin = location.pathname.includes('/login') || /登录/.test(document.title);
-      if (isLogin && !clickedJaccount) {
-        const target = clickable().find((node) => /jaccount|统一身份|校内用户/i.test(text(node)));
-        if (target) { clickedJaccount = true; target.click(); }
-      }
-    }
-    if (host === 'jaccount.sjtu.edu.cn') {
-      const controls = clickable();
-      controls.forEach((node) => {
-        const href = node.getAttribute('href') || '';
-        if (
-          /账号密码|短信验证|密码登录|短信登录|交我办快速登录/.test(text(node)) ||
-          href.startsWith('jaccount://') ||
-          href === 'https://jaccount.sjtu.edu.cn/jaccount/#'
-        ) hide(node);
-      });
-      document.querySelectorAll('input[type="password"], input[name*="password" i], input[name*="username" i], input[autocomplete="username"]').forEach((node) => {
-        hide(node);
-        hide(node.parentElement);
-      });
-    }
-  };
-  const start = () => {
-    document.addEventListener('click', (event) => {
-      const target = event.target?.closest?.('a,button');
-      if (!target) return;
-      const href = target.getAttribute('href') || '';
-      if (href.startsWith('jaccount://') || /交我办快速登录/.test(text(target))) {
-        event.preventDefault();
-        event.stopImmediatePropagation();
-      }
-    }, true);
-    tick();
-    if (document.documentElement && !observer) {
-      observer = new MutationObserver(tick);
-      observer.observe(document.documentElement, { childList: true, subtree: true });
-    }
-  };
-  if (document.documentElement) start();
-  else document.addEventListener('DOMContentLoaded', start, { once: true });
-  setInterval(tick, 700);
-})();
-"#;
+const CANVAS_ORIGIN: &str = "https://oc.sjtu.edu.cn";
+const VIDEO_API: &str = "https://v.sjtu.edu.cn/jy-application-canvas-sjtu";
 
 struct AppState {
     session: Mutex<Option<VideoSession>>,
     download_slots: Arc<Semaphore>,
+    cookie_jar: Mutex<Arc<Jar>>,
+    qr_login: Mutex<Option<QrLoginController>>,
 }
 
 impl AppState {
@@ -87,7 +33,30 @@ impl AppState {
         Self {
             session: Mutex::new(None),
             download_slots: Arc::new(Semaphore::new(2)),
+            cookie_jar: Mutex::new(Arc::new(Jar::default())),
+            qr_login: Mutex::new(None),
         }
+    }
+
+    fn cookie_jar(&self) -> Result<Arc<Jar>, String> {
+        self.cookie_jar
+            .lock()
+            .map_err(|_| "会话状态不可用".to_string())
+            .map(|guard| guard.clone())
+    }
+
+    fn replace_cookie_jar(&self) -> Result<(), String> {
+        let mut guard = self.cookie_jar.lock().map_err(|_| "会话状态不可用")?;
+        *guard = Arc::new(Jar::default());
+        Ok(())
+    }
+
+    fn stop_qr_login(&self) -> Result<(), String> {
+        let mut guard = self.qr_login.lock().map_err(|_| "会话状态不可用")?;
+        if let Some(mut controller) = guard.take() {
+            controller.stop();
+        }
+        Ok(())
     }
 }
 
@@ -110,7 +79,7 @@ struct AccessParams {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct AuthStatus {
+pub(crate) struct AuthStatus {
     phase: &'static str,
     message: String,
 }
@@ -228,117 +197,199 @@ fn api_error<T>(response: &ApiEnvelope<T>, context: &str) -> String {
     )
 }
 
-fn allowed_navigation(url: &Url) -> bool {
-    matches!(
-        url.host_str(),
-        Some("oc.sjtu.edu.cn") | Some("jaccount.sjtu.edu.cn") | Some("v.sjtu.edu.cn")
-    )
+fn parse_redirect_params(url: &str) -> HashMap<String, String> {
+    let Ok(parsed) = Url::parse(url) else {
+        return HashMap::new();
+    };
+    let mut params: HashMap<String, String> = parsed
+        .query()
+        .map(|query| url::form_urlencoded::parse(query.as_bytes()).into_owned().collect())
+        .unwrap_or_default();
+    if let Some(fragment) = parsed.fragment() {
+        if let Some((_, query)) = fragment.split_once('?') {
+            for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
+                params.insert(key.into_owned(), value.into_owned());
+            }
+        }
+    }
+    params
 }
 
-fn classify_auth_url(url: &Url) -> AuthStatus {
-    match url.host_str() {
-        Some("jaccount.sjtu.edu.cn") => AuthStatus {
-            phase: "qr-login",
-            message: "请使用交我办扫码".into(),
-        },
-        Some("oc.sjtu.edu.cn") if !url.path().contains("/login") => AuthStatus {
-            phase: "authorized",
-            message: "Canvas 已连接".into(),
-        },
-        Some("oc.sjtu.edu.cn") => AuthStatus {
-            phase: "canvas-login",
-            message: "正在进入 jAccount".into(),
-        },
-        Some("v.sjtu.edu.cn") => AuthStatus {
-            phase: "authorized",
-            message: "课堂视频已授权".into(),
-        },
-        _ => AuthStatus {
-            phase: "error",
-            message: "登录跳转到了未允许的地址".into(),
-        },
-    }
+fn form_inputs(form: scraper::ElementRef<'_>) -> HashMap<String, String> {
+    let input_selector = Selector::parse("input").unwrap();
+    form.select(&input_selector)
+        .filter_map(|input| {
+            let name = input.value().attr("name")?;
+            let value = input.value().attr("value").unwrap_or_default();
+            Some((name.to_string(), value.to_string()))
+        })
+        .collect()
+}
+
+async fn external_tool_id(client: &Client, course_id: u64) -> String {
+    let default_id = "8329".to_string();
+    let response = match client
+        .get(format!("{CANVAS_ORIGIN}/courses/{course_id}"))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return default_id,
+    };
+    let html = match response.text().await {
+        Ok(html) => html,
+        Err(_) => return default_id,
+    };
+    let document = Html::parse_document(&html);
+    let selector = match Selector::parse("div#main a") {
+        Ok(selector) => selector,
+        Err(_) => return default_id,
+    };
+    document
+        .select(&selector)
+        .find(|link| {
+            link.text()
+                .collect::<String>()
+                .starts_with("课堂视频")
+                && !link.text().collect::<String>().ends_with("旧版")
+        })
+        .and_then(|link| link.value().attr("href"))
+        .map(|href| href.rsplit('/').next().unwrap_or("8329").to_string())
+        .unwrap_or(default_id)
+}
+
+async fn authorize_video_session(
+    client: &Client,
+    course_id: u64,
+) -> Result<VideoSession, String> {
+    let tool_id = external_tool_id(client, course_id).await;
+    let launch_html = client
+        .get(format!(
+            "{CANVAS_ORIGIN}/courses/{course_id}/external_tools/{tool_id}"
+        ))
+        .send()
+        .await
+        .map_err(|e| format!("打开课堂视频失败：{e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("读取课堂视频页面失败：{e}"))?;
+    let document = Html::parse_document(&launch_html);
+    let form_selector = Selector::parse("form").map_err(|e| e.to_string())?;
+    let launch_form = document
+        .select(&form_selector)
+        .find(|form| {
+            form.value()
+                .attr("action")
+                .is_some_and(|action| action.contains("/oidc/login_initiations"))
+        })
+        .ok_or("未找到视频平台登录表单，可能是 Cookie 已失效，或课程页面结构已变化")?;
+    let launch_data = form_inputs(launch_form);
+
+    let initiation_html = client
+        .post(format!("{VIDEO_API}/oidc/login_initiations"))
+        .form(&launch_data)
+        .send()
+        .await
+        .map_err(|e| format!("视频平台登录失败：{e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("读取视频平台响应失败：{e}"))?;
+    let initiation_doc = Html::parse_document(&initiation_html);
+    let auth_form = initiation_doc
+        .select(&form_selector)
+        .find(|form| {
+            form.value()
+                .attr("action")
+                .is_some_and(|action| action.contains("/lti3/lti3Auth/ivs"))
+        })
+        .ok_or("未找到 LTI 鉴权表单，可能是登录状态失效，或学校视频平台返回流程已变化")?;
+    let auth_data = form_inputs(auth_form);
+
+    let auth_response = client
+        .post(format!("{VIDEO_API}/lti3/lti3Auth/ivs"))
+        .form(&auth_data)
+        .redirect(reqwest::redirect::Policy::none())
+        .send()
+        .await
+        .map_err(|e| format!("LTI 鉴权失败：{e}"))?;
+    let redirect = auth_response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| {
+            if auth_response.status().is_redirection() {
+                None
+            } else {
+                auth_response.url().as_str().into()
+            }
+        })
+        .ok_or("视频平台未返回跳转地址")?
+        .to_string();
+    let params = parse_redirect_params(&redirect);
+    let token_id = params
+        .get("tokenId")
+        .cloned()
+        .ok_or("未能从视频平台跳转中解析 tokenId")?;
+
+    let envelope = client
+        .get(format!("{VIDEO_API}/lti3/getAccessTokenByTokenId"))
+        .query(&[("tokenId", token_id.as_str())])
+        .send()
+        .await
+        .map_err(|e| format!("视频授权失败：{e}"))?
+        .json::<ApiEnvelope<ExchangeData>>()
+        .await
+        .map_err(|e| format!("视频授权响应异常：{e}"))?;
+    let error = api_error(&envelope, "视频授权失败");
+    let data = envelope.data.ok_or(error)?;
+    Ok(VideoSession {
+        token: data.token,
+        params: data.params,
+    })
 }
 
 #[tauri::command]
-async fn open_login(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("login") {
-        window.show().map_err(|e| e.to_string())?;
-        window.set_focus().map_err(|e| e.to_string())?;
-        if let Ok(url) = window.url() {
-            let _ = app.emit("auth-status", classify_auth_url(&url));
-        }
-        return Ok(());
-    }
-
-    let url = Url::parse(CANVAS_ORIGIN).map_err(|e| e.to_string())?;
-    let events = app.clone();
-    let login_window = WebviewWindowBuilder::new(&app, "login", WebviewUrl::External(url))
-        .title("交我办扫码登录")
-        .inner_size(520.0, 760.0)
-        .min_inner_size(420.0, 600.0)
-        .resizable(true)
-        .initialization_script(LOGIN_SCRIPT)
-        .on_navigation(allowed_navigation)
-        .on_page_load(move |_window, payload| {
-            let status = classify_auth_url(payload.url());
-            let _ = events.emit("auth-status", status);
-        })
-        .build()
-        .map_err(|e| e.to_string())?;
-    let window_to_hide = login_window.clone();
-    let close_events = app.clone();
-    login_window.on_window_event(move |event| {
-        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-            api.prevent_close();
-            let _ = window_to_hide.hide();
-            let status = window_to_hide
-                .url()
-                .map(|url| classify_auth_url(&url))
-                .unwrap_or(AuthStatus {
-                    phase: "canvas-login",
-                    message: "登录窗口已隐藏，可随时重新打开".into(),
-                });
-            let _ = close_events.emit("auth-status", status);
-        }
-    });
+async fn open_login(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.stop_qr_login()?;
+    let jar = state.cookie_jar()?;
+    let controller = spawn_qr_login(app, jar);
+    *state.qr_login.lock().map_err(|_| "会话状态不可用")? = Some(controller);
     Ok(())
 }
 
-async fn cookie_header_for(window: WebviewWindow, url: &str) -> Result<String, String> {
-    let parsed = Url::parse(url).map_err(|e| e.to_string())?;
-    let cookies = tokio::task::spawn_blocking(move || window.cookies_for_url(parsed))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())?;
-    if cookies.is_empty() {
-        return Err("没有找到登录 Cookie，请重新扫码".into());
-    }
-    Ok(cookies
-        .iter()
-        .map(|cookie| format!("{}={}", cookie.name(), cookie.value()))
-        .collect::<Vec<_>>()
-        .join("; "))
+#[tauri::command]
+async fn refresh_qr_code(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    let guard = state.qr_login.lock().map_err(|_| "会话状态不可用")?;
+    let controller = guard
+        .as_ref()
+        .ok_or("请先开始扫码登录")?;
+    controller.refresh();
+    Ok(())
 }
 
-fn http_client() -> Result<Client, String> {
-    Client::builder()
-        .user_agent("CanvasPocket/0.1")
-        .redirect(reqwest::redirect::Policy::limited(8))
-        .build()
-        .map_err(|e| e.to_string())
+async fn cookie_header_for(jar: &Jar, origin: &str) -> Result<String, String> {
+    let parsed = Url::parse(origin).map_err(|e| e.to_string())?;
+    let cookie = jar
+        .cookies(&parsed)
+        .and_then(|value| value.to_str().ok().map(str::to_string))
+        .ok_or_else(|| "没有找到登录 Cookie，请重新扫码".to_string())?;
+    if cookie.is_empty() {
+        return Err("没有找到登录 Cookie，请重新扫码".into());
+    }
+    Ok(cookie)
+}
+
+fn http_client(jar: Arc<Jar>) -> Result<Client, String> {
+    client_with_jar(jar)
 }
 
 #[tauri::command]
-async fn list_courses(app: tauri::AppHandle) -> Result<Vec<Course>, String> {
-    let window = app
-        .get_webview_window("login")
-        .ok_or_else(|| "请先打开扫码登录窗口".to_string())?;
-    let cookie = cookie_header_for(window, CANVAS_ORIGIN).await?;
-    let response = http_client()?
+async fn list_courses(state: tauri::State<'_, AppState>) -> Result<Vec<Course>, String> {
+    let jar = state.cookie_jar()?;
+    let _ = cookie_header_for(&jar, CANVAS_ORIGIN).await?;
+    let response = http_client(jar)?
         .get(format!("{CANVAS_ORIGIN}/api/v1/courses"))
         .query(&[("enrollment_state", "active"), ("per_page", "100")])
-        .header(header::COOKIE, cookie)
         .send()
         .await
         .map_err(|e| format!("读取课程失败：{e}"))?;
@@ -353,47 +404,6 @@ async fn list_courses(app: tauri::AppHandle) -> Result<Vec<Course>, String> {
         .into_iter()
         .filter(|course| !course.name.trim().is_empty())
         .collect())
-}
-
-fn token_from_video_url(url: &Url) -> Option<String> {
-    if url.host_str() != Some("v.sjtu.edu.cn") {
-        return None;
-    }
-    let fragment = url.fragment()?;
-    let query = fragment.split_once('?')?.1;
-    url::form_urlencoded::parse(query.as_bytes())
-        .find(|(key, _)| key == "tokenId")
-        .map(|(_, value)| value.into_owned())
-}
-
-async fn video_cookie(app: &tauri::AppHandle) -> Option<String> {
-    let window = app.get_webview_window("login")?;
-    cookie_header_for(window, VIDEO_ORIGIN).await.ok()
-}
-
-async fn exchange_video_token(
-    app: &tauri::AppHandle,
-    token_id: &str,
-) -> Result<VideoSession, String> {
-    let mut request = http_client()?
-        .get(format!("{VIDEO_API}/lti3/getAccessTokenByTokenId"))
-        .query(&[("tokenId", token_id)]);
-    if let Some(cookie) = video_cookie(app).await {
-        request = request.header(header::COOKIE, cookie);
-    }
-    let envelope = request
-        .send()
-        .await
-        .map_err(|e| format!("视频授权失败：{e}"))?
-        .json::<ApiEnvelope<ExchangeData>>()
-        .await
-        .map_err(|e| format!("视频授权响应异常：{e}"))?;
-    let error = api_error(&envelope, "视频授权失败");
-    let data = envelope.data.ok_or(error)?;
-    Ok(VideoSession {
-        token: data.token,
-        params: data.params,
-    })
 }
 
 fn json_string(value: &Value, keys: &[&str]) -> String {
@@ -446,33 +456,13 @@ impl StringFallback for String {
 
 #[tauri::command]
 async fn load_lessons(
-    app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     course_id: u64,
 ) -> Result<Vec<Lesson>, String> {
-    let window = app
-        .get_webview_window("login")
-        .ok_or_else(|| "请先完成扫码登录".to_string())?;
-    let lti_url = Url::parse(&format!(
-        "{CANVAS_ORIGIN}/courses/{course_id}/external_tools/8329?display=borderless"
-    ))
-    .map_err(|e| e.to_string())?;
-    window.navigate(lti_url).map_err(|e| e.to_string())?;
-
-    let started = Instant::now();
-    let token_id = loop {
-        if started.elapsed() > Duration::from_secs(35) {
-            return Err("课堂视频授权超时，请重新选择课程".into());
-        }
-        let current = window.url().map_err(|e| e.to_string())?;
-        if let Some(token) = token_from_video_url(&current) {
-            break token;
-        }
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    };
-
-    let video_session = exchange_video_token(&app, &token_id).await?;
-    let envelope = http_client()?
+    let jar = state.cookie_jar()?;
+    let client = http_client(jar)?;
+    let video_session = authorize_video_session(&client, course_id).await?;
+    let envelope = client
         .post(format!("{VIDEO_API}/directOnDemandPlay/findVodVideoList"))
         .header("token", &video_session.token)
         .json(&serde_json::json!({ "canvasCourseId": video_session.params.cour_id }))
@@ -489,6 +479,7 @@ async fn load_lessons(
 }
 
 async fn fetch_video_detail(
+    client: &Client,
     session: &VideoSession,
     lesson_id: &str,
 ) -> Result<VideoDetail, String> {
@@ -496,7 +487,7 @@ async fn fetch_video_detail(
         .text("playTypeHls", "true")
         .text("isAudit", "true")
         .text("id", lesson_id.to_string());
-    let envelope = http_client()?
+    let envelope = client
         .post(format!("{VIDEO_API}/directOnDemandPlay/getVodVideoInfos"))
         .header("token", &session.token)
         .multipart(form)
@@ -760,6 +751,7 @@ async fn start_download(
         .clone()
         .ok_or_else(|| "请先选择课程并读取讲次".to_string())?;
     let slots = state.download_slots.clone();
+    let jar = state.cookie_jar()?;
     let task_id = uuid::Uuid::new_v4().to_string();
     let task_return = task_id.clone();
     let task_app = app.clone();
@@ -807,8 +799,8 @@ async fn start_download(
             fs::create_dir_all(&directory)
                 .await
                 .map_err(|e| format!("无法创建保存目录：{e}"))?;
-            let client = http_client()?;
-            let detail = fetch_video_detail(&session, &request.lesson_id).await?;
+            let client = http_client(jar)?;
+            let detail = fetch_video_detail(&client, &session, &request.lesson_id).await?;
             let wanted: HashSet<&str> = request.signals.iter().map(String::as_str).collect();
             for track in detail
                 .video_play_response_vo_list
@@ -848,18 +840,9 @@ async fn start_download(
 }
 
 #[tauri::command]
-async fn logout(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("login") {
-        let clear_window = window.clone();
-        tokio::task::spawn_blocking(move || clear_window.clear_all_browsing_data())
-            .await
-            .map_err(|e| e.to_string())?
-            .map_err(|e| e.to_string())?;
-        window
-            .navigate(Url::parse(CANVAS_ORIGIN).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
-        window.hide().map_err(|e| e.to_string())?;
-    }
+async fn logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
+    state.stop_qr_login()?;
+    state.replace_cookie_jar()?;
     *state.session.lock().map_err(|_| "会话状态不可用")? = None;
     Ok(())
 }
@@ -881,6 +864,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             open_login,
+            refresh_qr_code,
             list_courses,
             load_lessons,
             default_download_dir,

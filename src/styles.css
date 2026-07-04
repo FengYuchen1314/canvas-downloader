@@ -54,7 +54,11 @@ button { color: inherit; }
 .hero-card > p:first-of-type { margin: 80px 0 10px; color: var(--lime); font-weight: 600; }
 .hero-card h2 { margin: 0; font-size: 48px; line-height: 1.08; letter-spacing: -.05em; }
 .hero-card .muted { max-width: 500px; color: #c9d3ca; line-height: 1.7; font-size: 14px; }
-.hero-actions { position: absolute; z-index: 1; left: 34px; bottom: 34px; display: flex; align-items: center; gap: 18px; }
+.qr-panel { position: relative; z-index: 1; margin: 28px 0 120px; display: grid; gap: 10px; justify-items: start; }
+.qr-image { width: 220px; height: 220px; border-radius: 16px; background: white; padding: 12px; cursor: pointer; box-shadow: 0 10px 30px rgba(0,0,0,.18); }
+.qr-placeholder { width: 220px; height: 220px; border-radius: 16px; display: grid; place-items: center; padding: 16px; text-align: center; color: #d8e2da; background: rgba(255,255,255,.08); border: 1px dashed rgba(255,255,255,.22); font-size: 13px; }
+.qr-panel small { color: #c9d3ca; font-size: 11px; }
+.hero-actions { position: absolute; z-index: 1; left: 34px; bottom: 34px; display: flex; align-items: center; gap: 18px; flex-wrap: wrap; }
 .primary-button { border: 0; border-radius: 999px; padding: 14px 22px; background: var(--lime); color: var(--ink); font-weight: 700; cursor: pointer; box-shadow: 0 8px 26px rgba(18,36,25,.16); }
 .primary-button:disabled { opacity: .35; cursor: default; }
 .hero-actions .text-button { color: white; }
