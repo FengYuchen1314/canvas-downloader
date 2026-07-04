@@ -6,9 +6,8 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use futures_util::StreamExt;
-use reqwest::{Client, StatusCode, cookie::Jar, header, multipart};
+use reqwest::{Client, StatusCode, cookie::CookieStore, cookie::Jar, header};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -20,6 +19,7 @@ use auth::{QrLoginController, client_with_jar, spawn_qr_login};
 
 const CANVAS_ORIGIN: &str = "https://oc.sjtu.edu.cn";
 const VIDEO_API: &str = "https://v.sjtu.edu.cn/jy-application-canvas-sjtu";
+const VIDEO_REFERER: &str = "https://courses.sjtu.edu.cn";
 
 struct AppState {
     session: Mutex<Option<VideoSession>>,
@@ -63,7 +63,8 @@ impl AppState {
 #[derive(Clone, Debug)]
 struct VideoSession {
     token: String,
-    params: AccessParams,
+    canvas_course_id: String,
+    course_id: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -111,7 +112,6 @@ struct DownloadRequest {
     lesson_title: String,
     begin_time: String,
     signals: Vec<String>,
-    include_subtitles: bool,
     output_dir: Option<String>,
 }
 
@@ -143,17 +143,9 @@ struct ExchangeData {
     params: AccessParams,
 }
 
-#[derive(Deserialize)]
-struct LessonPage {
-    #[serde(default)]
-    records: Vec<Value>,
-}
-
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct VideoDetail {
-    #[serde(default)]
-    cour_id: String,
     #[serde(default)]
     video_play_response_vo_list: Vec<VideoTrack>,
 }
@@ -161,6 +153,7 @@ struct VideoDetail {
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct VideoTrack {
+    #[serde(default, deserialize_with = "deserialize_stringish")]
     id: String,
     #[serde(default)]
     cdvi_view_num: i64,
@@ -168,21 +161,17 @@ struct VideoTrack {
     rtmp_url_hdv: String,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SubtitleData {
-    #[serde(default)]
-    after_assembly_list: Vec<SubtitleCue>,
-}
-
-#[derive(Deserialize)]
-struct SubtitleCue {
-    #[serde(default)]
-    bg: i64,
-    #[serde(default)]
-    ed: i64,
-    #[serde(default)]
-    res: String,
+fn deserialize_stringish<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    match value {
+        Value::String(text) => Ok(text),
+        Value::Number(number) => Ok(number.to_string()),
+        Value::Null => Ok(String::new()),
+        other => Ok(other.to_string()),
+    }
 }
 
 fn api_error<T>(response: &ApiEnvelope<T>, context: &str) -> String {
@@ -259,10 +248,12 @@ async fn external_tool_id(client: &Client, course_id: u64) -> String {
 }
 
 async fn authorize_video_session(
-    client: &Client,
+    jar: Arc<Jar>,
     course_id: u64,
 ) -> Result<VideoSession, String> {
-    let tool_id = external_tool_id(client, course_id).await;
+    let client = http_client(jar.clone())?;
+    let no_redirect = http_client_no_redirect(jar)?;
+    let tool_id = external_tool_id(&client, course_id).await;
     let launch_html = client
         .get(format!(
             "{CANVAS_ORIGIN}/courses/{course_id}/external_tools/{tool_id}"
@@ -273,17 +264,19 @@ async fn authorize_video_session(
         .text()
         .await
         .map_err(|e| format!("读取课堂视频页面失败：{e}"))?;
-    let document = Html::parse_document(&launch_html);
-    let form_selector = Selector::parse("form").map_err(|e| e.to_string())?;
-    let launch_form = document
-        .select(&form_selector)
-        .find(|form| {
-            form.value()
-                .attr("action")
-                .is_some_and(|action| action.contains("/oidc/login_initiations"))
-        })
-        .ok_or("未找到视频平台登录表单，可能是 Cookie 已失效，或课程页面结构已变化")?;
-    let launch_data = form_inputs(launch_form);
+    let launch_data = {
+        let document = Html::parse_document(&launch_html);
+        let form_selector = Selector::parse("form").map_err(|e| e.to_string())?;
+        let launch_form = document
+            .select(&form_selector)
+            .find(|form| {
+                form.value()
+                    .attr("action")
+                    .is_some_and(|action| action.contains("/oidc/login_initiations"))
+            })
+            .ok_or("未找到视频平台登录表单，可能是 Cookie 已失效，或课程页面结构已变化")?;
+        form_inputs(launch_form)
+    };
 
     let initiation_html = client
         .post(format!("{VIDEO_API}/oidc/login_initiations"))
@@ -294,21 +287,23 @@ async fn authorize_video_session(
         .text()
         .await
         .map_err(|e| format!("读取视频平台响应失败：{e}"))?;
-    let initiation_doc = Html::parse_document(&initiation_html);
-    let auth_form = initiation_doc
-        .select(&form_selector)
-        .find(|form| {
-            form.value()
-                .attr("action")
-                .is_some_and(|action| action.contains("/lti3/lti3Auth/ivs"))
-        })
-        .ok_or("未找到 LTI 鉴权表单，可能是登录状态失效，或学校视频平台返回流程已变化")?;
-    let auth_data = form_inputs(auth_form);
+    let auth_data = {
+        let initiation_doc = Html::parse_document(&initiation_html);
+        let form_selector = Selector::parse("form").map_err(|e| e.to_string())?;
+        let auth_form = initiation_doc
+            .select(&form_selector)
+            .find(|form| {
+                form.value()
+                    .attr("action")
+                    .is_some_and(|action| action.contains("/lti3/lti3Auth/ivs"))
+            })
+            .ok_or("未找到 LTI 鉴权表单，可能是登录状态失效，或学校视频平台返回流程已变化")?;
+        form_inputs(auth_form)
+    };
 
-    let auth_response = client
+    let auth_response = no_redirect
         .post(format!("{VIDEO_API}/lti3/lti3Auth/ivs"))
         .form(&auth_data)
-        .redirect(reqwest::redirect::Policy::none())
         .send()
         .await
         .map_err(|e| format!("LTI 鉴权失败：{e}"))?;
@@ -316,15 +311,15 @@ async fn authorize_video_session(
         .headers()
         .get(header::LOCATION)
         .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
         .or_else(|| {
             if auth_response.status().is_redirection() {
                 None
             } else {
-                auth_response.url().as_str().into()
+                Some(auth_response.url().to_string())
             }
         })
-        .ok_or("视频平台未返回跳转地址")?
-        .to_string();
+        .ok_or("视频平台未返回跳转地址")?;
     let params = parse_redirect_params(&redirect);
     let token_id = params
         .get("tokenId")
@@ -342,15 +337,25 @@ async fn authorize_video_session(
         .map_err(|e| format!("视频授权响应异常：{e}"))?;
     let error = api_error(&envelope, "视频授权失败");
     let data = envelope.data.ok_or(error)?;
+    let canvas_course_id = [
+        data.params.cour_id.as_str(),
+        data.params.lti_course_id.as_str(),
+    ]
+    .iter()
+    .find(|value| !value.is_empty())
+    .map(|value| (*value).to_string())
+    .ok_or("未能从视频平台解析课程 ID")?;
     Ok(VideoSession {
         token: data.token,
-        params: data.params,
+        canvas_course_id,
+        course_id,
     })
 }
 
 #[tauri::command]
 async fn open_login(app: tauri::AppHandle, state: tauri::State<'_, AppState>) -> Result<(), String> {
     state.stop_qr_login()?;
+    state.replace_cookie_jar()?;
     let jar = state.cookie_jar()?;
     let controller = spawn_qr_login(app, jar);
     *state.qr_login.lock().map_err(|_| "会话状态不可用")? = Some(controller);
@@ -381,6 +386,15 @@ async fn cookie_header_for(jar: &Jar, origin: &str) -> Result<String, String> {
 
 fn http_client(jar: Arc<Jar>) -> Result<Client, String> {
     client_with_jar(jar)
+}
+
+fn http_client_no_redirect(jar: Arc<Jar>) -> Result<Client, String> {
+    Client::builder()
+        .cookie_provider(jar)
+        .user_agent("CanvasPocket/0.1")
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -454,28 +468,199 @@ impl StringFallback for String {
     }
 }
 
+fn nested_value<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    let mut current = value;
+    for key in path {
+        current = current.get(*key)?;
+    }
+    Some(current)
+}
+
+fn extract_video_records(payload: &Value) -> Option<Vec<Value>> {
+    if let Some(array) = payload.as_array() {
+        return Some(array.clone());
+    }
+    let paths: &[&[&str]] = &[
+        &["data", "records"],
+        &["data", "list"],
+        &["data", "rows"],
+        &["data", "items"],
+        &["data", "page", "records"],
+        &["data", "page", "list"],
+        &["body", "list"],
+        &["body"],
+        &["data"],
+    ];
+    for path in paths {
+        if let Some(Value::Array(records)) = nested_value(payload, path) {
+            return Some(records.clone());
+        }
+    }
+    None
+}
+
+fn course_id_candidates(course_id: u64, canvas_course_id: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for value in [canvas_course_id.to_string(), course_id.to_string()] {
+        if value.is_empty() || candidates.contains(&value) {
+            continue;
+        }
+        candidates.push(value.clone());
+        if value.chars().all(|ch| ch.is_ascii_digit()) {
+            let trimmed = value.trim_start_matches('0').to_string();
+            if !trimmed.is_empty() && !candidates.contains(&trimmed) {
+                candidates.push(trimmed);
+            }
+        }
+        let encoded = urlencoding::encode(&value).into_owned();
+        if !encoded.is_empty() && !candidates.contains(&encoded) {
+            candidates.push(encoded);
+        }
+    }
+    candidates
+}
+
+async fn request_video_list(
+    client: &Client,
+    session: &VideoSession,
+) -> Result<Vec<Value>, String> {
+    let candidate_ids = course_id_candidates(session.course_id, &session.canvas_course_id);
+    let mut last_summary = String::new();
+
+    for candidate_id in candidate_ids {
+        let bodies = [
+            serde_json::json!({ "canvasCourseId": candidate_id }),
+            serde_json::json!({ "canvasCourseId": candidate_id, "pageIndex": 1, "pageSize": 1000 }),
+            serde_json::json!({ "courId": candidate_id }),
+            serde_json::json!({ "courId": candidate_id, "pageIndex": 1, "pageSize": 1000 }),
+            serde_json::json!({ "courseId": candidate_id }),
+            serde_json::json!({ "ltiCourseId": candidate_id }),
+        ];
+        for body in bodies {
+            let response = client
+                .post(format!("{VIDEO_API}/directOnDemandPlay/findVodVideoList"))
+                .header("token", &session.token)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| format!("读取讲次失败：{e}"))?;
+            let payload: Value = response
+                .json()
+                .await
+                .map_err(|e| format!("讲次响应异常：{e}"))?;
+            if let Some(records) = extract_video_records(&payload) {
+                return Ok(records);
+            }
+            last_summary = format!(
+                "code={:?}, message={:?}, data_type={}",
+                payload.get("code"),
+                payload.get("message").or_else(|| payload.get("msg")),
+                payload
+                    .get("data")
+                    .map(|value| match value {
+                        Value::Null => "null",
+                        Value::Object(_) => "object",
+                        Value::Array(_) => "array",
+                        Value::String(_) => "string",
+                        _ => "other",
+                    })
+                    .unwrap_or("missing")
+            );
+        }
+    }
+
+    Err(format!(
+        "视频列表接口未返回可识别的数据，尝试课程 ID：{}，最后一次返回：{last_summary}",
+        course_id_candidates(session.course_id, &session.canvas_course_id).join(", ")
+    ))
+}
+
 #[tauri::command]
 async fn load_lessons(
     state: tauri::State<'_, AppState>,
     course_id: u64,
 ) -> Result<Vec<Lesson>, String> {
     let jar = state.cookie_jar()?;
-    let client = http_client(jar)?;
-    let video_session = authorize_video_session(&client, course_id).await?;
-    let envelope = client
-        .post(format!("{VIDEO_API}/directOnDemandPlay/findVodVideoList"))
-        .header("token", &video_session.token)
-        .json(&serde_json::json!({ "canvasCourseId": video_session.params.cour_id }))
+    let video_session = authorize_video_session(jar, course_id).await?;
+    let client = http_client(state.cookie_jar()?)?;
+    let records = request_video_list(&client, &video_session).await?;
+    *state.session.lock().map_err(|_| "会话状态不可用")? = Some(video_session);
+    Ok(lessons_from_records(records))
+}
+
+fn video_api_message(payload: &Value) -> Option<String> {
+    payload
+        .get("message")
+        .or_else(|| payload.get("msg"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn video_payload_detail(payload: &Value) -> Result<VideoDetail, String> {
+    if payload.get("success").and_then(Value::as_bool) == Some(false) {
+        return Err(video_api_message(payload).unwrap_or_else(|| "视频服务拒绝请求".into()));
+    }
+    if let Some(message) = video_api_message(payload) {
+        if message.contains("解密") {
+            return Err(message);
+        }
+    }
+    if payload.get("data").and_then(Value::as_str).is_some() {
+        return Err(video_api_message(payload).unwrap_or_else(|| "视频详情返回加密数据，请重新进入课程".into()));
+    }
+    for key in ["data", "body"] {
+        let Some(node) = payload.get(key) else {
+            continue;
+        };
+        if let Ok(detail) = serde_json::from_value::<VideoDetail>(node.clone()) {
+            if !detail.video_play_response_vo_list.is_empty() {
+                return Ok(detail);
+            }
+        }
+    }
+    Err(format!(
+        "视频详情接口未返回可识别的数据：{}",
+        video_api_message(payload).unwrap_or_else(|| {
+            payload
+                .as_object()
+                .map(|obj| obj.keys().cloned().collect::<Vec<_>>().join(", "))
+                .unwrap_or_else(|| payload.to_string())
+        })
+    ))
+}
+
+async fn post_video_form(
+    client: &Client,
+    session: &VideoSession,
+    path: &str,
+    fields: &[(&str, &str)],
+) -> Result<Value, String> {
+    let response = client
+        .post(format!("{VIDEO_API}{path}"))
+        .header("token", &session.token)
+        .header(header::ACCEPT, "application/json, text/plain, */*")
+        .form(fields)
         .send()
         .await
-        .map_err(|e| format!("读取讲次失败：{e}"))?
-        .json::<ApiEnvelope<LessonPage>>()
+        .map_err(|e| format!("读取视频分轨失败：{e}"))?;
+    let status = response.status();
+    let body = response
+        .text()
         .await
-        .map_err(|e| format!("讲次响应异常：{e}"))?;
-    let error = api_error(&envelope, "读取讲次失败");
-    let page = envelope.data.ok_or(error)?;
-    *state.session.lock().map_err(|_| "会话状态不可用")? = Some(video_session);
-    Ok(lessons_from_records(page.records))
+        .map_err(|e| format!("读取视频分轨失败：{e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "视频服务返回 {}：{}",
+            status,
+            body.chars().take(240).collect::<String>()
+        ));
+    }
+    serde_json::from_str(&body).map_err(|error| {
+        format!(
+            "视频分轨响应异常：{error}；内容：{}",
+            body.chars().take(240).collect::<String>()
+        )
+    })
 }
 
 async fn fetch_video_detail(
@@ -483,22 +668,18 @@ async fn fetch_video_detail(
     session: &VideoSession,
     lesson_id: &str,
 ) -> Result<VideoDetail, String> {
-    let form = multipart::Form::new()
-        .text("playTypeHls", "true")
-        .text("isAudit", "true")
-        .text("id", lesson_id.to_string());
-    let envelope = client
-        .post(format!("{VIDEO_API}/directOnDemandPlay/getVodVideoInfos"))
-        .header("token", &session.token)
-        .multipart(form)
-        .send()
-        .await
-        .map_err(|e| format!("读取视频分轨失败：{e}"))?
-        .json::<ApiEnvelope<VideoDetail>>()
-        .await
-        .map_err(|e| format!("视频分轨响应异常：{e}"))?;
-    let error = api_error(&envelope, "读取视频分轨失败");
-    envelope.data.ok_or(error)
+    let payload = post_video_form(
+        client,
+        session,
+        "/directOnDemandPlay/getVodVideoInfos",
+        &[
+            ("playTypeHls", "true"),
+            ("isAudit", "true"),
+            ("id", lesson_id),
+        ],
+    )
+    .await?;
+    video_payload_detail(&payload)
 }
 
 fn track_name(code: i64) -> &'static str {
@@ -539,16 +720,26 @@ fn emit_progress(app: &tauri::AppHandle, progress: DownloadProgress) {
 async fn download_track(
     app: &tauri::AppHandle,
     client: &Client,
-    session: &VideoSession,
     request: &DownloadRequest,
     track: &VideoTrack,
     directory: &Path,
     task_id: &str,
 ) -> Result<(), String> {
+    if track.rtmp_url_hdv.trim().is_empty() {
+        return Err("该分轨没有可用的下载地址".into());
+    }
+
     let signal = track_name(track.cdvi_view_num);
     let date = request.begin_time.get(..10).unwrap_or("");
     let stem = safe_filename(&format!("{}_{}_{}", request.lesson_title, date, signal));
-    let file_name = format!("{stem}.mp4");
+    let extension = track
+        .rtmp_url_hdv
+        .split('?')
+        .next()
+        .and_then(|url| url.rsplit('.').next())
+        .filter(|ext| ext.len() <= 5)
+        .unwrap_or("mp4");
+    let file_name = format!("{stem}.{extension}");
     let destination = directory.join(&file_name);
     let partial = directory.join(format!("{file_name}.part"));
     if destination.exists() {
@@ -571,24 +762,17 @@ async fn download_track(
         .await
         .map(|meta| meta.len())
         .unwrap_or(0);
-    let encoded = BASE64.encode(track.id.as_bytes());
-    let official_url = format!("{VIDEO_API}/directOnDemandPlay/downloadVideo?id={encoded}");
-    let mut builder = client.get(&official_url).header("token", &session.token);
+    let mut builder = client
+        .get(&track.rtmp_url_hdv)
+        .header(header::REFERER, VIDEO_REFERER);
     if existing > 0 {
         builder = builder.header(header::RANGE, format!("bytes={existing}-"));
     }
-    let mut response = builder
+    let response = builder
         .send()
         .await
         .map_err(|e| format!("下载请求失败：{e}"))?;
-    if !response.status().is_success() {
-        response = client
-            .get(&track.rtmp_url_hdv)
-            .send()
-            .await
-            .map_err(|e| format!("备用下载请求失败：{e}"))?;
-    }
-    if !response.status().is_success() {
+    if !response.status().is_success() && response.status() != StatusCode::PARTIAL_CONTENT {
         return Err(format!("视频服务返回 {}", response.status()));
     }
 
@@ -641,89 +825,6 @@ async fn download_track(
             downloaded,
             total: Some(downloaded),
             message: "视频下载完成".into(),
-        },
-    );
-    Ok(())
-}
-
-fn srt_time(milliseconds: i64) -> String {
-    let value = milliseconds.max(0);
-    let hours = value / 3_600_000;
-    let minutes = (value / 60_000) % 60;
-    let seconds = (value / 1_000) % 60;
-    let millis = value % 1_000;
-    format!("{hours:02}:{minutes:02}:{seconds:02},{millis:03}")
-}
-
-async fn download_subtitles(
-    app: &tauri::AppHandle,
-    client: &Client,
-    session: &VideoSession,
-    request: &DownloadRequest,
-    detail: &VideoDetail,
-    directory: &Path,
-    task_id: &str,
-) -> Result<(), String> {
-    let envelope = client
-        .post(format!("{VIDEO_API}/transfer/translate/detail"))
-        .header("token", &session.token)
-        .json(&serde_json::json!({ "courseId": detail.cour_id, "platform": 1 }))
-        .send()
-        .await
-        .map_err(|e| format!("读取字幕失败：{e}"))?
-        .json::<ApiEnvelope<SubtitleData>>()
-        .await
-        .map_err(|e| format!("字幕响应异常：{e}"))?;
-    let Some(data) = envelope.data else {
-        return Ok(());
-    };
-    if data.after_assembly_list.is_empty() {
-        return Ok(());
-    }
-    let date = request.begin_time.get(..10).unwrap_or("");
-    let file_name = format!(
-        "{}.srt",
-        safe_filename(&format!("{}_{}_AI字幕", request.lesson_title, date))
-    );
-    emit_progress(
-        app,
-        DownloadProgress {
-            task_id: task_id.into(),
-            lesson_id: request.lesson_id.clone(),
-            file_name: file_name.clone(),
-            stage: "writing-subtitles",
-            downloaded: 0,
-            total: None,
-            message: "正在写入字幕".into(),
-        },
-    );
-    let mut output = String::new();
-    for (index, cue) in data.after_assembly_list.iter().enumerate() {
-        let text = cue.res.trim();
-        if text.is_empty() {
-            continue;
-        }
-        output.push_str(&format!(
-            "{}\n{} --> {}\n{}\n\n",
-            index + 1,
-            srt_time(cue.bg),
-            srt_time(cue.ed),
-            text
-        ));
-    }
-    fs::write(directory.join(&file_name), output)
-        .await
-        .map_err(|e| format!("字幕写入失败：{e}"))?;
-    emit_progress(
-        app,
-        DownloadProgress {
-            task_id: task_id.into(),
-            lesson_id: request.lesson_id.clone(),
-            file_name,
-            stage: "completed",
-            downloaded: 0,
-            total: None,
-            message: "字幕已保存".into(),
         },
     );
     Ok(())
@@ -807,16 +908,7 @@ async fn start_download(
                 .iter()
                 .filter(|track| wanted.contains(track_name(track.cdvi_view_num)))
             {
-                download_track(
-                    &task_app, &client, &session, &request, track, &directory, &task_id,
-                )
-                .await?;
-            }
-            if request.include_subtitles {
-                download_subtitles(
-                    &task_app, &client, &session, &request, &detail, &directory, &task_id,
-                )
-                .await?;
+                download_track(&task_app, &client, &request, track, &directory, &task_id).await?;
             }
             Ok(())
         }

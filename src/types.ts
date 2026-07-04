@@ -25,7 +25,6 @@ export interface DownloadRequest {
   lessonTitle: string;
   beginTime: string;
   signals: string[];
-  includeSubtitles: boolean;
   outputDir: string | null;
 }
 
@@ -33,7 +32,7 @@ export interface DownloadProgress {
   taskId: string;
   lessonId: string;
   fileName: string;
-  stage: "queued" | "downloading" | "writing-subtitles" | "completed" | "failed";
+  stage: "queued" | "downloading" | "completed" | "failed";
   downloaded: number;
   total: number | null;
   message: string;

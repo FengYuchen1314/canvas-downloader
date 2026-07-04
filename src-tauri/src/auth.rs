@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use reqwest::{Client, cookie::Jar, header};
+use reqwest::{Client, cookie::Jar, cookie::CookieStore, header};
 use scraper::{Html, Selector};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
@@ -54,12 +54,18 @@ fn extract_uuid(html: &str) -> Result<String, String> {
         .next()
         .and_then(|node| node.value().attr("href"))
         .ok_or("未找到 jAccount 登录入口，页面结构可能已变化")?;
+    if let Some(idx) = href.find("uuid=") {
+        let uuid = href[idx + 5..].split('&').next().unwrap_or_default();
+        if !uuid.is_empty() {
+            return Ok(uuid.to_string());
+        }
+    }
     href.rsplit('=')
         .next()
         .and_then(|tail| tail.split('&').next())
         .filter(|uuid| !uuid.is_empty())
         .map(str::to_string)
-        .ok_or("无法从登录页解析 uuid")
+        .ok_or_else(|| "无法从登录页解析 uuid".to_string())
 }
 
 async fn fetch_login_page(client: &Client) -> Result<(String, String), String> {
@@ -78,10 +84,17 @@ async fn fetch_login_page(client: &Client) -> Result<(String, String), String> {
     Ok((uuid, final_url))
 }
 
-async fn fetch_qr_image(client: &Client, uuid: &str, ts: &str, sig: &str) -> Result<Vec<u8>, String> {
+async fn fetch_qr_image(
+    client: &Client,
+    uuid: &str,
+    ts: &str,
+    sig: &str,
+    referer: &str,
+) -> Result<Vec<u8>, String> {
     let response = client
         .get(JACCOUNT_QR_URL)
         .query(&[("uuid", uuid), ("ts", ts), ("sig", sig)])
+        .header(header::REFERER, referer)
         .send()
         .await
         .map_err(|e| format!("获取二维码失败：{e}"))?;
@@ -95,11 +108,64 @@ async fn fetch_qr_image(client: &Client, uuid: &str, ts: &str, sig: &str) -> Res
         .map_err(|e| format!("读取二维码失败：{e}"))
 }
 
-fn jaccount_cookie_header(jar: &Jar) -> Result<String, String> {
-    let url = Url::parse(JACCOUNT_WS_ORIGIN).map_err(|e| e.to_string())?;
-    jar.cookies(&url)
-        .and_then(|value| value.to_str().ok().map(str::to_string))
-        .ok_or_else(|| "缺少 jAccount Cookie，请刷新二维码".into())
+fn value_as_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        Value::Number(number) => Some(number.to_string()),
+        _ => None,
+    }
+}
+
+fn merge_cookie_header(existing: &mut Vec<(String, String)>, header_value: &str) {
+    for part in header_value.split(';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((name, value)) = part.split_once('=') else {
+            continue;
+        };
+        let name = name.trim().to_string();
+        let value = value.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        if let Some(entry) = existing.iter_mut().find(|(key, _)| key == &name) {
+            entry.1 = value;
+        } else {
+            existing.push((name, value));
+        }
+    }
+}
+
+fn jaccount_cookie_header(jar: &Jar, page_url: &str) -> Result<String, String> {
+    let candidates = [
+        page_url.to_string(),
+        format!("{JACCOUNT_WS_ORIGIN}/jaccount/"),
+        format!("{JACCOUNT_WS_ORIGIN}/jaccount/jalogin"),
+        JACCOUNT_WS_ORIGIN.to_string(),
+        "https://courses.sjtu.edu.cn/".to_string(),
+    ];
+    let mut pairs = Vec::new();
+    for candidate in candidates {
+        let Ok(url) = Url::parse(&candidate) else {
+            continue;
+        };
+        if let Some(header_value) = jar
+            .cookies(&url)
+            .and_then(|header| header.to_str().ok().map(str::to_string))
+        {
+            merge_cookie_header(&mut pairs, &header_value);
+        }
+    }
+    if pairs.is_empty() {
+        return Err("缺少 jAccount Cookie，请刷新二维码".into());
+    }
+    Ok(pairs
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; "))
 }
 
 async fn complete_jaccount_login(client: &Client, uuid: &str) -> Result<(), String> {
@@ -178,7 +244,7 @@ pub async fn run_qr_login(
         }
     };
 
-    let cookie_header = match jaccount_cookie_header(&jar) {
+    let cookie_header = match jaccount_cookie_header(&jar, &referer) {
         Ok(cookie) => cookie,
         Err(message) => {
             emit_auth(&app, "error", message);
@@ -194,6 +260,14 @@ pub async fn run_qr_login(
             return;
         }
     };
+    request.headers_mut().insert(
+        header::ORIGIN,
+        header::HeaderValue::from_static("https://jaccount.sjtu.edu.cn"),
+    );
+    request.headers_mut().insert(
+        header::USER_AGENT,
+        header::HeaderValue::from_static("CanvasPocket/0.1"),
+    );
     request
         .headers_mut()
         .insert(header::COOKIE, header::HeaderValue::from_str(&cookie_header).unwrap());
@@ -206,7 +280,7 @@ pub async fn run_qr_login(
         }
     };
 
-    use futures_util::{SinkExt, StreamExt};
+    use futures_util::StreamExt;
     let (mut ws_tx, mut ws_rx) = ws_stream.split();
     let mut refresh_rx = refresh_rx;
 
@@ -242,10 +316,32 @@ pub async fn run_qr_login(
                     };
                     match payload.get("type").and_then(Value::as_str) {
                         Some("UPDATE_QR_CODE") => {
+                            if payload
+                                .get("error")
+                                .and_then(Value::as_i64)
+                                .is_some_and(|code| code != 0)
+                            {
+                                emit_auth(
+                                    &app,
+                                    "error",
+                                    format!(
+                                        "二维码服务返回错误 {}",
+                                        payload
+                                            .get("error")
+                                            .and_then(Value::as_i64)
+                                            .unwrap_or(-1)
+                                    ),
+                                );
+                                continue;
+                            }
                             let Some(body) = payload.get("payload") else { continue; };
-                            let Some(ts) = body.get("ts").and_then(Value::as_str) else { continue; };
-                            let Some(sig) = body.get("sig").and_then(Value::as_str) else { continue; };
-                            match fetch_qr_image(&client, &uuid, ts, sig).await {
+                            let Some(ts) = body.get("ts").and_then(value_as_string) else {
+                                continue;
+                            };
+                            let Some(sig) = body.get("sig").and_then(value_as_string) else {
+                                continue;
+                            };
+                            match fetch_qr_image(&client, &uuid, &ts, &sig, &referer).await {
                                 Ok(bytes) => emit_qr_code(&app, &bytes),
                                 Err(message) => emit_auth(&app, "error", message),
                             }

@@ -29,7 +29,6 @@ function App() {
   const [lessons, setLessons] = useState<Lesson[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [signals, setSignals] = useState<Set<string>>(new Set(["教师", "PPT"]));
-  const [includeSubtitles, setIncludeSubtitles] = useState(true);
   const [outputDir, setOutputDir] = useState("");
   const [query, setQuery] = useState("");
   const [qrImage, setQrImage] = useState("");
@@ -140,7 +139,7 @@ function App() {
 
   const startDownloads = async () => {
     const picked = lessons.filter((lesson) => selected.has(lesson.videoId));
-    if (!picked.length || (!signals.size && !includeSubtitles)) return;
+    if (!picked.length || !signals.size) return;
     setError("");
     try {
       await Promise.all(
@@ -150,7 +149,6 @@ function App() {
             lessonTitle: lesson.title,
             beginTime: lesson.beginTime,
             signals: [...signals],
-            includeSubtitles,
             outputDir: outputDir.trim() || null,
           };
           return invoke<string>("start_download", { request });
@@ -244,8 +242,7 @@ function App() {
               </div>
             </div>
             <div className="promise-stack">
-              <article><span>双路</span><h3>教师画面 + PPT</h3><p>保留原始 1080p 分轨，也为后续合成留足余地。</p></article>
-              <article><span>字幕</span><h3>AI 字幕另存 SRT</h3><p>保留毫秒时间轴，中文、英文翻译有就一起带走。</p></article>
+              <article><span>直链</span><h3>rtmpUrlHdv 下载</h3><p>与 sjtu-canvas-video-download 相同，直接拉取平台返回的 MP4 地址。</p></article>
               <article><span>本地</span><h3>令牌只活在内存</h3><p>课程资料落在你选择的目录，登录凭据不写入项目。</p></article>
             </div>
           </section>
@@ -300,12 +297,8 @@ function App() {
                   <label key={signal}><input type="checkbox" checked={signals.has(signal)} onChange={() => toggleSignal(signal)} /><i />{signal}</label>
                 ))}
               </div>
-              <div className="option-group">
-                <span>辅助文件</span>
-                <label><input type="checkbox" checked={includeSubtitles} onChange={(event) => setIncludeSubtitles(event.target.checked)} /><i />AI 字幕 .srt</label>
-              </div>
               <label className="path-field"><span>保存目录</span><input value={outputDir} onChange={(event) => setOutputDir(event.target.value)} /></label>
-              <button className="primary-button wide" disabled={!selected.size || (!signals.size && !includeSubtitles)} onClick={startDownloads}>开始下载</button>
+              <button className="primary-button wide" disabled={!selected.size || !signals.size} onClick={startDownloads}>开始下载</button>
               <small>并发数固定为 2，避免挤占校园网和视频服务。</small>
             </aside>
           </section>
