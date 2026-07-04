@@ -25,10 +25,17 @@ use auth::{QrLoginController, client_with_jar, spawn_qr_login};
 const CANVAS_ORIGIN: &str = "https://oc.sjtu.edu.cn";
 const VIDEO_API: &str = "https://v.sjtu.edu.cn/jy-application-canvas-sjtu";
 const VIDEO_REFERER: &str = "https://courses.sjtu.edu.cn";
+const DEFAULT_DOWNLOAD_CONCURRENCY: usize = 16;
+const MAX_DOWNLOAD_CONCURRENCY: usize = 64;
+
+struct DownloadConcurrency {
+    limit: usize,
+    slots: Arc<Semaphore>,
+}
 
 struct AppState {
     session: Mutex<Option<VideoSession>>,
-    download_slots: Arc<Semaphore>,
+    download_concurrency: Mutex<DownloadConcurrency>,
     cookie_jar: Mutex<Arc<Jar>>,
     qr_login: Mutex<Option<QrLoginController>>,
     downloads: Mutex<HashMap<String, ActiveDownload>>,
@@ -93,11 +100,39 @@ impl AppState {
     fn new() -> Self {
         Self {
             session: Mutex::new(None),
-            download_slots: Arc::new(Semaphore::new(2)),
+            download_concurrency: Mutex::new(DownloadConcurrency {
+                limit: DEFAULT_DOWNLOAD_CONCURRENCY,
+                slots: Arc::new(Semaphore::new(DEFAULT_DOWNLOAD_CONCURRENCY)),
+            }),
             cookie_jar: Mutex::new(Arc::new(Jar::default())),
             qr_login: Mutex::new(None),
             downloads: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn download_slots(&self) -> Result<Arc<Semaphore>, String> {
+        self.download_concurrency
+            .lock()
+            .map_err(|_| "下载并发设置不可用".to_string())
+            .map(|guard| guard.slots.clone())
+    }
+
+    fn download_concurrency_limit(&self) -> Result<usize, String> {
+        self.download_concurrency
+            .lock()
+            .map_err(|_| "下载并发设置不可用".to_string())
+            .map(|guard| guard.limit)
+    }
+
+    fn set_download_concurrency(&self, limit: usize) -> Result<usize, String> {
+        let limit = limit.clamp(1, MAX_DOWNLOAD_CONCURRENCY);
+        let mut guard = self
+            .download_concurrency
+            .lock()
+            .map_err(|_| "下载并发设置不可用".to_string())?;
+        guard.limit = limit;
+        guard.slots = Arc::new(Semaphore::new(limit));
+        Ok(limit)
     }
 
     fn register_download(&self, task_id: String, download: ActiveDownload) -> Result<(), String> {
@@ -183,22 +218,22 @@ pub(crate) struct AuthStatus {
     message: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 struct Course {
     id: u64,
     name: String,
     #[serde(default)]
     course_code: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     start_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     end_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     created_at: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     workflow_state: Option<String>,
-    #[serde(default, skip_deserializing)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     enrollment_state: Option<String>,
 }
 
@@ -221,6 +256,7 @@ struct DownloadRequest {
     begin_time: String,
     signals: Vec<String>,
     output_dir: Option<String>,
+    course_name: Option<String>,
 }
 
 #[derive(Serialize, Clone)]
@@ -607,11 +643,18 @@ async fn fetch_courses_by_enrollment(
         if !response.status().is_success() {
             return Err(format!("Canvas 返回 {}，请重新扫码", response.status()));
         }
-        let batch = response
-            .json::<Vec<Course>>()
+        let body = response
+            .text()
             .await
-            .map_err(|e| format!("课程数据格式异常：{e}"))?;
-        let count = batch.len();
+            .map_err(|e| format!("读取课程失败：{e}"))?;
+        let values: Vec<Value> = serde_json::from_str(&body).map_err(|error| {
+            format!(
+                "课程数据格式异常：{error}；内容：{}",
+                body.chars().take(240).collect::<String>()
+            )
+        })?;
+        let batch: Vec<Course> = values.iter().filter_map(course_from_value).collect();
+        let count = values.len();
         courses.extend(batch);
         if count < 100 {
             break;
@@ -619,6 +662,51 @@ async fn fetch_courses_by_enrollment(
         page += 1;
     }
     Ok(courses)
+}
+
+fn json_u64(value: &Value, key: &str) -> Option<u64> {
+    value.get(key).and_then(|entry| {
+        entry
+            .as_u64()
+            .or_else(|| entry.as_i64().map(|number| number as u64))
+            .or_else(|| entry.as_str()?.parse().ok())
+    })
+}
+
+fn json_opt_string(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let entry = value.get(*key)?;
+        match entry {
+            Value::Null => None,
+            Value::String(text) if text.trim().is_empty() => None,
+            Value::String(text) => Some(text.trim().to_string()),
+            Value::Number(number) => Some(number.to_string()),
+            _ => None,
+        }
+    })
+}
+
+fn course_from_value(value: &Value) -> Option<Course> {
+    let id = json_u64(value, "id")?;
+    let course_code = json_string(value, &["course_code", "courseCode"]);
+    let name = json_string(value, &["name"])
+        .trim()
+        .to_string()
+        .or_else_if_empty(|| course_code.clone())
+        .or_else_if_empty(|| format!("课程 {id}"));
+    if name.trim().is_empty() {
+        return None;
+    }
+    Some(Course {
+        id,
+        name,
+        course_code,
+        start_at: json_opt_string(value, &["start_at", "startAt"]),
+        end_at: json_opt_string(value, &["end_at", "endAt"]),
+        created_at: json_opt_string(value, &["created_at", "createdAt"]),
+        workflow_state: json_opt_string(value, &["workflow_state", "workflowState"]),
+        enrollment_state: None,
+    })
 }
 
 fn json_string(value: &Value, keys: &[&str]) -> String {
@@ -1088,7 +1176,7 @@ async fn download_track(
     Ok(())
 }
 
-async fn run_download_task(app: tauri::AppHandle, slots: Arc<Semaphore>, jar: Arc<Jar>, task_id: String) {
+async fn run_download_task(app: tauri::AppHandle, jar: Arc<Jar>, task_id: String) {
     let (meta, control, _, running) = match app.state::<AppState>().get_download(&task_id) {
         Ok(parts) => parts,
         Err(message) => {
@@ -1131,6 +1219,27 @@ async fn run_download_task(app: tauri::AppHandle, slots: Arc<Semaphore>, jar: Ar
         },
     );
 
+    let slots = match app.state::<AppState>().download_slots() {
+        Ok(slots) => slots,
+        Err(message) => {
+            running.store(false, Ordering::Release);
+            emit_progress(
+                &app,
+                DownloadProgress {
+                    task_id: task_id.clone(),
+                    lesson_id: meta.lesson_id.clone(),
+                    lesson_title: meta.lesson_title.clone(),
+                    signal: meta.signal.clone(),
+                    file_name: String::new(),
+                    stage: "failed",
+                    downloaded: 0,
+                    total: None,
+                    message,
+                },
+            );
+            return;
+        }
+    };
     let _permit = match slots.acquire().await {
         Ok(permit) => permit,
         Err(error) => {
@@ -1171,6 +1280,7 @@ async fn run_download_task(app: tauri::AppHandle, slots: Arc<Semaphore>, jar: Ar
                     .to_string_lossy()
                     .into_owned(),
             ),
+            course_name: None,
         };
         let context = DownloadTaskContext {
             task_id: task_id.clone(),
@@ -1223,13 +1333,25 @@ async fn run_download_task(app: tauri::AppHandle, slots: Arc<Semaphore>, jar: Ar
     }
 }
 
-#[tauri::command]
-fn default_download_dir() -> String {
+fn default_download_root() -> PathBuf {
     dirs::download_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("Canvas Pocket")
-        .to_string_lossy()
-        .into_owned()
+        .join("Canvas Downloads")
+}
+
+fn course_download_dir(base: &Path, course_name: Option<&str>, course_id: u64) -> PathBuf {
+    let label = course_name
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(safe_filename)
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| format!("course_{course_id}"));
+    base.join(label)
+}
+
+#[tauri::command]
+fn default_download_dir() -> String {
+    default_download_root().to_string_lossy().into_owned()
 }
 
 #[tauri::command]
@@ -1246,15 +1368,16 @@ async fn start_download(
         .ok_or_else(|| "请先选择课程并读取讲次".to_string())?;
     let jar = state.cookie_jar()?;
     let client = http_client(jar.clone())?;
-    let directory = request
+    let base_dir = request
         .output_dir
         .as_ref()
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            dirs::download_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("Canvas Pocket")
-        });
+        .unwrap_or_else(default_download_root);
+    let directory = course_download_dir(
+        &base_dir,
+        request.course_name.as_deref(),
+        session.course_id,
+    );
     fs::create_dir_all(&directory)
         .await
         .map_err(|e| format!("无法创建保存目录：{e}"))?;
@@ -1281,7 +1404,6 @@ async fn start_download(
         ));
     }
 
-    let slots = state.download_slots.clone();
     let mut task_ids = Vec::new();
     for track in matched {
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -1318,10 +1440,9 @@ async fn start_download(
         emit_progress(&app, progress);
         task_ids.push(task_id.clone());
         let app_spawn = app.clone();
-        let slots_spawn = slots.clone();
         let jar_spawn = jar.clone();
         tauri::async_runtime::spawn(async move {
-            run_download_task(app_spawn, slots_spawn, jar_spawn, task_id).await;
+            run_download_task(app_spawn, jar_spawn, task_id).await;
         });
     }
     Ok(task_ids)
@@ -1360,7 +1481,6 @@ async fn resume_download(
         return Ok(());
     }
     control.resume();
-    let slots = state.download_slots.clone();
     let jar = state.cookie_jar()?;
     emit_progress(
         &app,
@@ -1377,9 +1497,22 @@ async fn resume_download(
         },
     );
     tauri::async_runtime::spawn(async move {
-        run_download_task(app, slots, jar, task_id).await;
+        run_download_task(app, jar, task_id).await;
     });
     Ok(())
+}
+
+#[tauri::command]
+fn get_download_concurrency(state: tauri::State<'_, AppState>) -> Result<usize, String> {
+    state.download_concurrency_limit()
+}
+
+#[tauri::command]
+fn set_download_concurrency(
+    state: tauri::State<'_, AppState>,
+    concurrency: usize,
+) -> Result<usize, String> {
+    state.set_download_concurrency(concurrency)
 }
 
 #[tauri::command]
@@ -1423,6 +1556,8 @@ pub fn run() {
             pause_download,
             resume_download,
             cancel_download,
+            get_download_concurrency,
+            set_download_concurrency,
             logout
         ])
         .run(tauri::generate_context!())

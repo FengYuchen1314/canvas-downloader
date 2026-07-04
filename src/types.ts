@@ -31,6 +31,7 @@ export interface DownloadRequest {
   beginTime: string;
   signals: string[];
   outputDir: string | null;
+  courseName: string | null;
 }
 
 export type DownloadStage =
