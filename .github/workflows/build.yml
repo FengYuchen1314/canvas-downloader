@@ -112,13 +112,19 @@ jobs:
           merge-multiple: true
           path: release-assets
 
+      - name: Prepare release files
+        run: |
+          mkdir -p release-files
+          find release-assets -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release-files/ \;
+          ls -la release-files/
+
       - name: Publish GitHub Release
         uses: ncipollo/release-action@v1
         with:
           allowUpdates: true
-          replaceArtifacts: true
+          replacesArtifacts: true
           artifactErrorsFailBuild: true
-          artifacts: release-assets/**
+          artifacts: release-files/*
           tag: v${{ steps.version.outputs.version }}
           name: Canvas Pocket v${{ steps.version.outputs.version }}
           commit: ${{ github.sha }}
