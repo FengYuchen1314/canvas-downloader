@@ -39,6 +39,31 @@ const stageLabel = (stage: DownloadStage) => {
 const shortCourseName = (name: string) =>
   name.replace(/^本-\([^)]*\)-[^-]+-\d+-/, "").trim() || name;
 
+const formatCourseDate = (course: Course) => {
+  const raw = course.endAt || course.startAt || course.createdAt;
+  if (!raw) return "日期未标注";
+  const parsed = Date.parse(raw);
+  if (Number.isNaN(parsed)) return raw.slice(0, 10);
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(parsed);
+};
+
+const enrollmentLabel = (course: Course) => {
+  switch (course.enrollmentState) {
+    case "active":
+      return "进行中";
+    case "completed":
+      return "已结束";
+    case "invited_or_pending":
+      return "待加入";
+    default:
+      return course.workflowState === "completed" ? "已结束" : "历史课程";
+  }
+};
+
 function App() {
   const [screen, setScreen] = useState<Screen>("welcome");
   const [auth, setAuth] = useState<AuthStatus>({ phase: "idle", message: "尚未连接 Canvas" });
@@ -48,6 +73,7 @@ function App() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [signals, setSignals] = useState<Set<string>>(new Set(["教师", "PPT"]));
   const [outputDir, setOutputDir] = useState("");
+  const [courseQuery, setCourseQuery] = useState("");
   const [query, setQuery] = useState("");
   const [qrImage, setQrImage] = useState("");
   const [busy, setBusy] = useState(false);
@@ -137,6 +163,23 @@ function App() {
       setBusy(false);
     }
   };
+
+  const visibleCourses = useMemo(() => {
+    const term = courseQuery.trim().toLowerCase();
+    if (!term) return courses;
+    return courses.filter((item) => {
+      const haystack = [
+        item.name,
+        item.courseCode,
+        item.startAt ?? "",
+        item.endAt ?? "",
+        enrollmentLabel(item),
+      ]
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(term);
+    });
+  }, [courses, courseQuery]);
 
   const visibleLessons = useMemo(() => {
     const term = query.trim().toLowerCase();
@@ -320,20 +363,34 @@ function App() {
 
         {screen === "courses" && (
           <section>
-            <div className="section-tools">
-              <p>{courses.length} 门活动课程</p>
+            <div className="section-tools course-tools">
+              <input
+                className="search-input"
+                value={courseQuery}
+                onChange={(event) => setCourseQuery(event.target.value)}
+                placeholder="搜索课程名、代码或日期"
+              />
+              <p>{visibleCourses.length} / {courses.length} 门课程</p>
               <button className="ghost-button" onClick={refreshCourses} disabled={busy}>重新读取</button>
             </div>
             <div className="course-grid">
-              {courses.map((item, index) => (
+              {visibleCourses.map((item, index) => (
                 <button className="course-card" key={item.id} onClick={() => chooseCourse(item)} disabled={busy}>
                   <span>{String(index + 1).padStart(2, "0")}</span>
                   <h2>{shortCourseName(item.name)}</h2>
-                  <p>{item.courseCode || `课程 ${item.id}`}</p>
-                  <div>查看课堂录像 →</div>
+                  <p>{item.courseCode || `课程 ${item.id}`} · {formatCourseDate(item)}</p>
+                  <div className="course-card-foot">
+                    <em>{enrollmentLabel(item)}</em>
+                    <span>查看课堂录像 →</span>
+                  </div>
                 </button>
               ))}
             </div>
+            {!visibleCourses.length && (
+              <div className="downloads-empty">
+                <p>{courses.length ? "没有匹配的课程。" : "还没有读取到课程。"}</p>
+              </div>
+            )}
           </section>
         )}
 

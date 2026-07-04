@@ -18,6 +18,8 @@ use tauri::{Emitter, Manager};
 use tokio::{fs, io::AsyncWriteExt, sync::Semaphore};
 use url::Url;
 
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+
 use auth::{QrLoginController, client_with_jar, spawn_qr_login};
 
 const CANVAS_ORIGIN: &str = "https://oc.sjtu.edu.cn";
@@ -188,6 +190,16 @@ struct Course {
     name: String,
     #[serde(default)]
     course_code: String,
+    #[serde(default)]
+    start_at: Option<String>,
+    #[serde(default)]
+    end_at: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
+    #[serde(default)]
+    workflow_state: Option<String>,
+    #[serde(default, skip_deserializing)]
+    enrollment_state: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -513,23 +525,100 @@ fn http_client_no_redirect(jar: Arc<Jar>) -> Result<Client, String> {
 async fn list_courses(state: tauri::State<'_, AppState>) -> Result<Vec<Course>, String> {
     let jar = state.cookie_jar()?;
     let _ = cookie_header_for(&jar, CANVAS_ORIGIN).await?;
-    let response = http_client(jar)?
-        .get(format!("{CANVAS_ORIGIN}/api/v1/courses"))
-        .query(&[("enrollment_state", "active"), ("per_page", "100")])
-        .send()
-        .await
-        .map_err(|e| format!("读取课程失败：{e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("Canvas 返回 {}，请重新扫码", response.status()));
+    let client = http_client(jar)?;
+    let enrollment_states = ["active", "completed", "invited_or_pending"];
+    let mut merged: HashMap<u64, Course> = HashMap::new();
+
+    for enrollment_state in enrollment_states {
+        let batch = fetch_courses_by_enrollment(&client, enrollment_state).await?;
+        for mut course in batch {
+            if course.name.trim().is_empty() {
+                continue;
+            }
+            course.enrollment_state = Some(enrollment_state.to_string());
+            merged
+                .entry(course.id)
+                .and_modify(|existing| {
+                    if enrollment_rank(enrollment_state)
+                        < enrollment_rank(existing.enrollment_state.as_deref().unwrap_or(""))
+                    {
+                        existing.enrollment_state = Some(enrollment_state.to_string());
+                    }
+                })
+                .or_insert(course);
+        }
     }
-    let courses = response
-        .json::<Vec<Course>>()
-        .await
-        .map_err(|e| format!("课程数据格式异常：{e}"))?;
-    Ok(courses
+
+    let mut courses: Vec<Course> = merged.into_values().collect();
+    courses.sort_by(|left, right| {
+        course_sort_timestamp(right)
+            .cmp(&course_sort_timestamp(left))
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(courses)
+}
+
+fn enrollment_rank(state: &str) -> u8 {
+    match state {
+        "active" => 0,
+        "invited_or_pending" => 1,
+        "completed" => 2,
+        _ => 3,
+    }
+}
+
+fn parse_canvas_time(value: &str) -> Option<i64> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|dt| dt.timestamp())
+        .or_else(|| {
+            NaiveDate::parse_from_str(value, "%Y-%m-%d")
+                .ok()
+                .and_then(|date| date.and_hms_opt(0, 0, 0))
+                .map(|time| Utc.from_utc_datetime(&time).timestamp())
+        })
+}
+
+fn course_sort_timestamp(course: &Course) -> i64 {
+    [&course.end_at, &course.start_at, &course.created_at]
         .into_iter()
-        .filter(|course| !course.name.trim().is_empty())
-        .collect())
+        .flatten()
+        .find_map(|value| parse_canvas_time(value))
+        .unwrap_or_else(|| course.id as i64)
+}
+
+async fn fetch_courses_by_enrollment(
+    client: &Client,
+    enrollment_state: &str,
+) -> Result<Vec<Course>, String> {
+    let mut page = 1u32;
+    let mut courses = Vec::new();
+    loop {
+        let response = client
+            .get(format!("{CANVAS_ORIGIN}/api/v1/courses"))
+            .query(&[
+                ("enrollment_state", enrollment_state),
+                ("per_page", "100"),
+                ("page", &page.to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|e| format!("读取课程失败：{e}"))?;
+        if !response.status().is_success() {
+            return Err(format!("Canvas 返回 {}，请重新扫码", response.status()));
+        }
+        let batch = response
+            .json::<Vec<Course>>()
+            .await
+            .map_err(|e| format!("课程数据格式异常：{e}"))?;
+        let count = batch.len();
+        courses.extend(batch);
+        if count < 100 {
+            break;
+        }
+        page += 1;
+    }
+    Ok(courses)
 }
 
 fn json_string(value: &Value, keys: &[&str]) -> String {

@@ -9,6 +9,11 @@ export interface Course {
   id: number;
   name: string;
   courseCode: string;
+  startAt?: string | null;
+  endAt?: string | null;
+  createdAt?: string | null;
+  workflowState?: string | null;
+  enrollmentState?: string | null;
 }
 
 export interface Lesson {
