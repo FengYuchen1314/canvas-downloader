@@ -115,13 +115,18 @@ jobs:
       - name: Prepare release files
         run: |
           mkdir -p release-files
-          find release-assets -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.deb' -o -name '*.rpm' \) -exec cp {} release-files/ \;
+          find release-assets -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.deb' -o -name '*.rpm' \) | while IFS= read -r file; do
+            platform="$(basename "$(dirname "$file")")"
+            name="$(basename "$file")"
+            cp "$file" "release-files/${platform}-${name}"
+          done
           ls -la release-files/
 
       - name: Publish GitHub Release
         uses: ncipollo/release-action@v1
         with:
           allowUpdates: true
+          removeArtifacts: true
           replacesArtifacts: true
           artifactErrorsFailBuild: true
           artifacts: release-files/*
