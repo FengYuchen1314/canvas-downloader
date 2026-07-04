@@ -64,6 +64,36 @@ const enrollmentLabel = (course: Course) => {
   }
 };
 
+const lessonNumber = (lesson: Lesson, fallbackIndex: number) => {
+  const match = lesson.title.match(/第?\s*(\d+)\s*讲/);
+  if (match) return Number.parseInt(match[1], 10);
+  const digits = lesson.title.replace(/[^0-9]/g, "");
+  const parsed = Number.parseInt(digits, 10);
+  if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+  return fallbackIndex + 1;
+};
+
+const parseLessonSelection = (input: string) => {
+  const normalized = input.trim().replace(/[，、;；\s]+/g, ",");
+  if (!normalized) return [];
+  const result = new Set<number>();
+  for (const part of normalized.split(",").filter(Boolean)) {
+    if (part.includes("-")) {
+      const [startRaw, endRaw] = part.split("-", 2);
+      const start = Number.parseInt(startRaw, 10);
+      const end = Number.parseInt(endRaw, 10);
+      if (Number.isNaN(start) || Number.isNaN(end)) continue;
+      const lo = Math.min(start, end);
+      const hi = Math.max(start, end);
+      for (let value = lo; value <= hi; value += 1) result.add(value);
+    } else {
+      const value = Number.parseInt(part, 10);
+      if (!Number.isNaN(value) && value > 0) result.add(value);
+    }
+  }
+  return [...result].sort((left, right) => left - right);
+};
+
 function App() {
   const [screen, setScreen] = useState<Screen>("welcome");
   const [auth, setAuth] = useState<AuthStatus>({ phase: "idle", message: "尚未连接 Canvas" });
@@ -75,6 +105,9 @@ function App() {
   const [outputDir, setOutputDir] = useState("");
   const [courseQuery, setCourseQuery] = useState("");
   const [query, setQuery] = useState("");
+  const [rangeFrom, setRangeFrom] = useState("");
+  const [rangeTo, setRangeTo] = useState("");
+  const [specificLessons, setSpecificLessons] = useState("");
   const [qrImage, setQrImage] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -156,6 +189,9 @@ function App() {
       const result = await invoke<Lesson[]>("load_lessons", { courseId: nextCourse.id });
       setLessons(result);
       setSelected(new Set());
+      setRangeFrom("");
+      setRangeTo("");
+      setSpecificLessons("");
       setScreen("lessons");
     } catch (reason) {
       setError(String(reason));
@@ -181,6 +217,29 @@ function App() {
     });
   }, [courses, courseQuery]);
 
+  const openLessons = useMemo(
+    () =>
+      lessons
+        .filter((lesson) => lesson.auditStatus === 3)
+        .sort((left, right) => left.beginTime.localeCompare(right.beginTime)),
+    [lessons],
+  );
+
+  const numberedLessons = useMemo(
+    () =>
+      openLessons.map((lesson, index) => ({
+        lesson,
+        number: lessonNumber(lesson, index),
+        videoId: lesson.videoId,
+      })),
+    [openLessons],
+  );
+
+  const availableLessonNumbers = useMemo(
+    () => [...new Set(numberedLessons.map((item) => item.number))].sort((left, right) => left - right),
+    [numberedLessons],
+  );
+
   const visibleLessons = useMemo(() => {
     const term = query.trim().toLowerCase();
     return lessons.filter(
@@ -189,6 +248,29 @@ function App() {
         (!term || `${lesson.title} ${lesson.beginTime} ${lesson.classroom}`.toLowerCase().includes(term)),
     );
   }, [lessons, query]);
+
+  const applyLessonNumbers = (numbers: number[]) => {
+    if (!numbers.length) {
+      setError("请输入有效的讲次编号");
+      return;
+    }
+    const wanted = new Set(numbers);
+    const ids = numberedLessons.filter(({ number }) => wanted.has(number)).map(({ videoId }) => videoId);
+    if (!ids.length) {
+      setError(`没有找到对应讲次。当前开放编号：${availableLessonNumbers.join("、") || "无"}`);
+      return;
+    }
+    setError("");
+    setSelected(new Set(ids));
+  };
+
+  const applyRangeSelection = () => {
+    applyLessonNumbers(parseLessonSelection(`${rangeFrom}-${rangeTo}`));
+  };
+
+  const applySpecificSelection = () => {
+    applyLessonNumbers(parseLessonSelection(specificLessons));
+  };
 
   const toggleLesson = (videoId: string) => {
     setSelected((current) => {
@@ -418,6 +500,46 @@ function App() {
             <aside className="download-panel">
               <p className="eyebrow">DOWNLOAD SET</p>
               <h2>{selected.size} 讲待下载</h2>
+              <div className="option-group pick-group">
+                <span>按讲次选择</span>
+                <div className="pick-row">
+                  <label>
+                    <span>从第</span>
+                    <input
+                      type="number"
+                      min={1}
+                      value={rangeFrom}
+                      onChange={(event) => setRangeFrom(event.target.value)}
+                      placeholder="1"
+                    />
+                    <span>讲到第</span>
+                    <input
+                      type="number"
+                      min={1}
+                      value={rangeTo}
+                      onChange={(event) => setRangeTo(event.target.value)}
+                      placeholder="10"
+                    />
+                    <span>讲</span>
+                  </label>
+                  <button className="ghost-button compact" type="button" onClick={applyRangeSelection}>应用范围</button>
+                </div>
+                <div className="pick-row">
+                  <label className="pick-specific">
+                    <span>指定讲次</span>
+                    <input
+                      value={specificLessons}
+                      onChange={(event) => setSpecificLessons(event.target.value)}
+                      placeholder="例如 1,3,5 或 1-3,8"
+                    />
+                  </label>
+                  <button className="ghost-button compact" type="button" onClick={applySpecificSelection}>应用指定</button>
+                </div>
+                <small>
+                  也可在左侧列表勾选。开放讲次 {openLessons.length} 个
+                  {availableLessonNumbers.length ? `，编号 ${availableLessonNumbers.join("、")}` : ""}
+                </small>
+              </div>
               <div className="option-group">
                 <span>视频分轨</span>
                 {["教师", "PPT"].map((signal) => (
