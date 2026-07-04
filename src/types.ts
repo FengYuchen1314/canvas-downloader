@@ -28,13 +28,22 @@ export interface DownloadRequest {
   outputDir: string | null;
 }
 
+export type DownloadStage =
+  | "queued"
+  | "downloading"
+  | "paused"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
 export interface DownloadProgress {
   taskId: string;
   lessonId: string;
+  lessonTitle: string;
+  signal: string;
   fileName: string;
-  stage: "queued" | "downloading" | "completed" | "failed";
+  stage: DownloadStage;
   downloaded: number;
   total: number | null;
   message: string;
 }
-

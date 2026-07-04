@@ -6,16 +6,34 @@ import type {
   Course,
   DownloadProgress,
   DownloadRequest,
+  DownloadStage,
   Lesson,
 } from "./types";
 
-type Screen = "welcome" | "courses" | "lessons";
+type Screen = "welcome" | "courses" | "lessons" | "downloads";
 
 const formatBytes = (value: number) => {
   if (!value) return "0 B";
   const units = ["B", "KB", "MB", "GB"];
   const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
   return `${(value / 1024 ** index).toFixed(index > 1 ? 1 : 0)} ${units[index]}`;
+};
+
+const stageLabel = (stage: DownloadStage) => {
+  switch (stage) {
+    case "queued":
+      return "排队中";
+    case "downloading":
+      return "下载中";
+    case "paused":
+      return "已暂停";
+    case "completed":
+      return "已完成";
+    case "failed":
+      return "失败";
+    case "cancelled":
+      return "已取消";
+  }
 };
 
 const shortCourseName = (name: string) =>
@@ -36,6 +54,15 @@ function App() {
   const [error, setError] = useState("");
   const [tasks, setTasks] = useState<Record<string, DownloadProgress>>({});
 
+  const refreshTasks = async () => {
+    try {
+      const result = await invoke<DownloadProgress[]>("list_download_tasks");
+      setTasks(Object.fromEntries(result.map((task) => [task.taskId, task])));
+    } catch {
+      // ignore when backend is not ready yet
+    }
+  };
+
   useEffect(() => {
     let stopAuth: (() => void) | undefined;
     let stopProgress: (() => void) | undefined;
@@ -52,6 +79,7 @@ function App() {
       setTasks((current) => ({ ...current, [update.taskId]: update }));
     }).then((unlisten) => (stopProgress = unlisten));
     void invoke<string>("default_download_dir").then(setOutputDir).catch(() => undefined);
+    void refreshTasks();
     return () => {
       stopAuth?.();
       stopProgress?.();
@@ -151,10 +179,39 @@ function App() {
             signals: [...signals],
             outputDir: outputDir.trim() || null,
           };
-          return invoke<string>("start_download", { request });
+          return invoke<string[]>("start_download", { request });
         }),
       );
       setSelected(new Set());
+      setScreen("downloads");
+      await refreshTasks();
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
+  const pauseTask = async (taskId: string) => {
+    setError("");
+    try {
+      await invoke("pause_download", { taskId });
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
+  const resumeTask = async (taskId: string) => {
+    setError("");
+    try {
+      await invoke("resume_download", { taskId });
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
+  const cancelTask = async (taskId: string) => {
+    setError("");
+    try {
+      await invoke("cancel_download", { taskId });
     } catch (reason) {
       setError(String(reason));
     }
@@ -167,10 +224,12 @@ function App() {
     setCourses([]);
     setLessons([]);
     setCourse(null);
+    setTasks({});
     setScreen("welcome");
   };
 
   const activeTasks = Object.values(tasks).sort((a, b) => b.taskId.localeCompare(a.taskId));
+  const activeCount = activeTasks.filter((task) => task.stage === "downloading" || task.stage === "queued").length;
   const statusTone = auth.phase === "authorized" ? "ok" : auth.phase === "error" ? "bad" : "idle";
 
   return (
@@ -194,6 +253,9 @@ function App() {
           <button className={screen === "lessons" ? "step active" : "step"} disabled={!course} onClick={() => setScreen("lessons")}>
             <span>03</span>下载录像
           </button>
+          <button className={screen === "downloads" ? "step active" : "step"} onClick={() => setScreen("downloads")}>
+            <span>04</span>下载任务{activeCount > 0 ? ` (${activeCount})` : ""}
+          </button>
         </nav>
 
         <div className="sidebar-foot">
@@ -209,7 +271,15 @@ function App() {
         <header className="topbar">
           <div>
             <p className="eyebrow">CANVAS @ SJTU</p>
-            <h1>{screen === "welcome" ? "把课程带走，慢慢消化。" : screen === "courses" ? "选择一门课程" : shortCourseName(course?.name ?? "课程录像")}</h1>
+            <h1>
+              {screen === "welcome"
+                ? "把课程带走，慢慢消化。"
+                : screen === "courses"
+                  ? "选择一门课程"
+                  : screen === "downloads"
+                    ? "下载任务"
+                    : shortCourseName(course?.name ?? "课程录像")}
+            </h1>
           </div>
           {auth.phase === "authorized" && (
             <button className="ghost-button" onClick={logout}>退出登录</button>
@@ -299,29 +369,71 @@ function App() {
               </div>
               <label className="path-field"><span>保存目录</span><input value={outputDir} onChange={(event) => setOutputDir(event.target.value)} /></label>
               <button className="primary-button wide" disabled={!selected.size || !signals.size} onClick={startDownloads}>开始下载</button>
-              <small>并发数固定为 2，避免挤占校园网和视频服务。</small>
+              <small>每个分轨单独成任务，支持暂停与断点续传。并发数固定为 2。</small>
             </aside>
           </section>
         )}
 
-        {busy && <div className="busy-layer"><div className="spinner" /><span>正在读取 Canvas…</span></div>}
-
-        {activeTasks.length > 0 && (
-          <section className="task-drawer">
-            <header><strong>下载任务</strong><span>{activeTasks.filter((task) => task.stage === "completed").length}/{activeTasks.length} 完成</span></header>
-            {activeTasks.slice(0, 6).map((task) => {
-              const percent = task.total ? Math.min(100, (task.downloaded / task.total) * 100) : task.stage === "completed" ? 100 : 8;
-              return <div className="task-row" key={task.taskId}>
-                <div><strong>{task.fileName || task.message}</strong><span>{task.stage === "failed" ? task.message : `${formatBytes(task.downloaded)}${task.total ? ` / ${formatBytes(task.total)}` : ""}`}</span></div>
-                <div className="progress-track"><i style={{ width: `${percent}%` }} /></div>
-              </div>;
-            })}
+        {screen === "downloads" && (
+          <section className="downloads-page">
+            <div className="section-tools">
+              <p>{activeTasks.length} 个任务 · {activeTasks.filter((task) => task.stage === "completed").length} 已完成</p>
+              <button className="ghost-button" onClick={() => void refreshTasks()}>刷新状态</button>
+            </div>
+            {activeTasks.length === 0 ? (
+              <div className="downloads-empty">
+                <p>还没有下载任务。</p>
+                <button className="ghost-button" disabled={!course} onClick={() => setScreen("lessons")}>去选择讲次</button>
+              </div>
+            ) : (
+              <div className="downloads-list">
+                {activeTasks.map((task) => {
+                  const percent = task.total
+                    ? Math.min(100, (task.downloaded / task.total) * 100)
+                    : task.stage === "completed"
+                      ? 100
+                      : task.downloaded > 0
+                        ? Math.max(8, Math.min(96, (task.downloaded % (50 * 1024 * 1024)) / (50 * 1024 * 1024) * 100))
+                        : 8;
+                  const canPause = task.stage === "downloading" || task.stage === "queued";
+                  const canResume = task.stage === "paused" || task.stage === "failed";
+                  const canCancel = task.stage !== "completed" && task.stage !== "cancelled";
+                  const title = task.fileName || `${task.lessonTitle} · ${task.signal}`;
+                  return (
+                    <article className={`download-task ${task.stage}`} key={task.taskId}>
+                      <div className="download-task-head">
+                        <div>
+                          <strong>{title}</strong>
+                          <span>{task.lessonTitle} · {task.signal}</span>
+                        </div>
+                        <em>{stageLabel(task.stage)}</em>
+                      </div>
+                      <div className="download-task-meta">
+                        <span>
+                          {task.stage === "failed" || task.stage === "cancelled"
+                            ? task.message
+                            : `${formatBytes(task.downloaded)}${task.total ? ` / ${formatBytes(task.total)}` : ""}`}
+                        </span>
+                        <span>{Math.round(percent)}%</span>
+                      </div>
+                      <div className="progress-track wide-track"><i style={{ width: `${percent}%` }} /></div>
+                      <div className="download-task-actions">
+                        {canPause && <button className="ghost-button" onClick={() => void pauseTask(task.taskId)}>暂停</button>}
+                        {canResume && <button className="primary-button compact" onClick={() => void resumeTask(task.taskId)}>继续</button>}
+                        {canCancel && <button className="text-button" onClick={() => void cancelTask(task.taskId)}>取消</button>}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            )}
           </section>
         )}
+
+        {busy && <div className="busy-layer"><div className="spinner" /><span>正在读取 Canvas…</span></div>}
       </section>
     </main>
   );
 }
 
 export default App;
-

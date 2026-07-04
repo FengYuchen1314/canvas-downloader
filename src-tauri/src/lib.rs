@@ -3,7 +3,10 @@ mod auth;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use futures_util::StreamExt;
@@ -26,6 +29,62 @@ struct AppState {
     download_slots: Arc<Semaphore>,
     cookie_jar: Mutex<Arc<Jar>>,
     qr_login: Mutex<Option<QrLoginController>>,
+    downloads: Mutex<HashMap<String, ActiveDownload>>,
+}
+
+#[derive(Clone)]
+struct TaskControl {
+    paused: Arc<AtomicBool>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl TaskControl {
+    fn new() -> Self {
+        Self {
+            paused: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+    }
+
+    fn resume(&self) {
+        self.paused.store(false, Ordering::Relaxed);
+        self.cancelled.store(false, Ordering::Relaxed);
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.paused.store(false, Ordering::Relaxed);
+    }
+
+    fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Relaxed)
+    }
+}
+
+#[derive(Clone)]
+struct DownloadTaskMeta {
+    session: VideoSession,
+    lesson_id: String,
+    lesson_title: String,
+    begin_time: String,
+    output_dir: PathBuf,
+    cdvi_view_num: i64,
+    signal: String,
+}
+
+struct ActiveDownload {
+    meta: DownloadTaskMeta,
+    control: TaskControl,
+    progress: DownloadProgress,
+    running: Arc<AtomicBool>,
 }
 
 impl AppState {
@@ -35,7 +94,44 @@ impl AppState {
             download_slots: Arc::new(Semaphore::new(2)),
             cookie_jar: Mutex::new(Arc::new(Jar::default())),
             qr_login: Mutex::new(None),
+            downloads: Mutex::new(HashMap::new()),
         }
+    }
+
+    fn register_download(&self, task_id: String, download: ActiveDownload) -> Result<(), String> {
+        let mut guard = self.downloads.lock().map_err(|_| "下载任务状态不可用")?;
+        guard.insert(task_id, download);
+        Ok(())
+    }
+
+    fn record_progress(&self, progress: &DownloadProgress) {
+        if let Ok(mut guard) = self.downloads.lock() {
+            if let Some(task) = guard.get_mut(&progress.task_id) {
+                task.progress = progress.clone();
+            }
+        }
+    }
+
+    fn get_download(&self, task_id: &str) -> Result<(DownloadTaskMeta, TaskControl, DownloadProgress, Arc<AtomicBool>), String> {
+        let guard = self.downloads.lock().map_err(|_| "下载任务状态不可用")?;
+        let task = guard.get(task_id).ok_or_else(|| "找不到下载任务".to_string())?;
+        Ok((
+            DownloadTaskMeta {
+                session: task.meta.session.clone(),
+                lesson_id: task.meta.lesson_id.clone(),
+                lesson_title: task.meta.lesson_title.clone(),
+                begin_time: task.meta.begin_time.clone(),
+                output_dir: task.meta.output_dir.clone(),
+                cdvi_view_num: task.meta.cdvi_view_num,
+                signal: task.meta.signal.clone(),
+            },
+            TaskControl {
+                paused: task.control.paused.clone(),
+                cancelled: task.control.cancelled.clone(),
+            },
+            task.progress.clone(),
+            task.running.clone(),
+        ))
     }
 
     fn cookie_jar(&self) -> Result<Arc<Jar>, String> {
@@ -120,6 +216,8 @@ struct DownloadRequest {
 struct DownloadProgress {
     task_id: String,
     lesson_id: String,
+    lesson_title: String,
+    signal: String,
     file_name: String,
     stage: &'static str,
     downloaded: u64,
@@ -157,8 +255,22 @@ struct VideoTrack {
     id: String,
     #[serde(default)]
     cdvi_view_num: i64,
-    #[serde(default)]
+    #[serde(default, alias = "rtmpUrlHdv")]
     rtmp_url_hdv: String,
+    #[serde(default, alias = "rtmpUrlHd")]
+    rtmp_url_hd: String,
+    #[serde(default, alias = "rtmpUrl")]
+    rtmp_url: String,
+}
+
+fn track_download_url(track: &VideoTrack) -> &str {
+    if !track.rtmp_url_hdv.trim().is_empty() {
+        return track.rtmp_url_hdv.trim();
+    }
+    if !track.rtmp_url_hd.trim().is_empty() {
+        return track.rtmp_url_hd.trim();
+    }
+    track.rtmp_url.trim()
 }
 
 fn deserialize_stringish<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -714,7 +826,17 @@ fn safe_filename(value: &str) -> String {
 }
 
 fn emit_progress(app: &tauri::AppHandle, progress: DownloadProgress) {
+    if let Some(state) = app.try_state::<AppState>() {
+        state.record_progress(&progress);
+    }
     let _ = app.emit("download-progress", progress);
+}
+
+struct DownloadTaskContext {
+    task_id: String,
+    lesson_title: String,
+    signal: String,
+    control: TaskControl,
 }
 
 async fn download_track(
@@ -723,17 +845,19 @@ async fn download_track(
     request: &DownloadRequest,
     track: &VideoTrack,
     directory: &Path,
-    task_id: &str,
+    context: &DownloadTaskContext,
 ) -> Result<(), String> {
-    if track.rtmp_url_hdv.trim().is_empty() {
-        return Err("该分轨没有可用的下载地址".into());
+    let download_url = track_download_url(track);
+    if download_url.is_empty() {
+        return Err(format!("{} 分轨没有可用的下载地址", context.signal));
     }
 
-    let signal = track_name(track.cdvi_view_num);
     let date = request.begin_time.get(..10).unwrap_or("");
-    let stem = safe_filename(&format!("{}_{}_{}", request.lesson_title, date, signal));
-    let extension = track
-        .rtmp_url_hdv
+    let stem = safe_filename(&format!(
+        "{}_{}_{}",
+        request.lesson_title, date, context.signal
+    ));
+    let extension = download_url
         .split('?')
         .next()
         .and_then(|url| url.rsplit('.').next())
@@ -746,8 +870,10 @@ async fn download_track(
         emit_progress(
             app,
             DownloadProgress {
-                task_id: task_id.into(),
+                task_id: context.task_id.clone(),
                 lesson_id: request.lesson_id.clone(),
+                lesson_title: context.lesson_title.clone(),
+                signal: context.signal.clone(),
                 file_name,
                 stage: "completed",
                 downloaded: destination.metadata().map(|m| m.len()).unwrap_or(0),
@@ -763,7 +889,7 @@ async fn download_track(
         .map(|meta| meta.len())
         .unwrap_or(0);
     let mut builder = client
-        .get(&track.rtmp_url_hdv)
+        .get(download_url)
         .header(header::REFERER, VIDEO_REFERER);
     if existing > 0 {
         builder = builder.header(header::RANGE, format!("bytes={existing}-"));
@@ -772,6 +898,9 @@ async fn download_track(
         .send()
         .await
         .map_err(|e| format!("下载请求失败：{e}"))?;
+    if context.control.is_cancelled() {
+        return Err("下载已取消".into());
+    }
     if !response.status().is_success() && response.status() != StatusCode::PARTIAL_CONTENT {
         return Err(format!("视频服务返回 {}", response.status()));
     }
@@ -793,6 +922,42 @@ async fn download_track(
     let mut downloaded = base;
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
+        if context.control.is_cancelled() {
+            file.flush().await.ok();
+            emit_progress(
+                app,
+                DownloadProgress {
+                    task_id: context.task_id.clone(),
+                    lesson_id: request.lesson_id.clone(),
+                    lesson_title: context.lesson_title.clone(),
+                    signal: context.signal.clone(),
+                    file_name: file_name.clone(),
+                    stage: "cancelled",
+                    downloaded,
+                    total,
+                    message: "下载已取消".into(),
+                },
+            );
+            return Err("下载已取消".into());
+        }
+        if context.control.is_paused() {
+            file.flush().await.ok();
+            emit_progress(
+                app,
+                DownloadProgress {
+                    task_id: context.task_id.clone(),
+                    lesson_id: request.lesson_id.clone(),
+                    lesson_title: context.lesson_title.clone(),
+                    signal: context.signal.clone(),
+                    file_name: file_name.clone(),
+                    stage: "paused",
+                    downloaded,
+                    total,
+                    message: "已暂停，可继续下载".into(),
+                },
+            );
+            return Ok(());
+        }
         let bytes = chunk.map_err(|e| format!("下载中断：{e}"))?;
         file.write_all(&bytes)
             .await
@@ -801,8 +966,10 @@ async fn download_track(
         emit_progress(
             app,
             DownloadProgress {
-                task_id: task_id.into(),
+                task_id: context.task_id.clone(),
                 lesson_id: request.lesson_id.clone(),
+                lesson_title: context.lesson_title.clone(),
+                signal: context.signal.clone(),
                 file_name: file_name.clone(),
                 stage: "downloading",
                 downloaded,
@@ -818,8 +985,10 @@ async fn download_track(
     emit_progress(
         app,
         DownloadProgress {
-            task_id: task_id.into(),
+            task_id: context.task_id.clone(),
             lesson_id: request.lesson_id.clone(),
+            lesson_title: context.lesson_title.clone(),
+            signal: context.signal.clone(),
             file_name,
             stage: "completed",
             downloaded,
@@ -828,6 +997,141 @@ async fn download_track(
         },
     );
     Ok(())
+}
+
+async fn run_download_task(app: tauri::AppHandle, slots: Arc<Semaphore>, jar: Arc<Jar>, task_id: String) {
+    let (meta, control, _, running) = match app.state::<AppState>().get_download(&task_id) {
+        Ok(parts) => parts,
+        Err(message) => {
+            emit_progress(
+                &app,
+                DownloadProgress {
+                    task_id: task_id.clone(),
+                    lesson_id: String::new(),
+                    lesson_title: String::new(),
+                    signal: String::new(),
+                    file_name: String::new(),
+                    stage: "failed",
+                    downloaded: 0,
+                    total: None,
+                    message,
+                },
+            );
+            return;
+        }
+    };
+    if running
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+        .is_err()
+    {
+        return;
+    }
+
+    emit_progress(
+        &app,
+        DownloadProgress {
+            task_id: task_id.clone(),
+            lesson_id: meta.lesson_id.clone(),
+            lesson_title: meta.lesson_title.clone(),
+            signal: meta.signal.clone(),
+            file_name: String::new(),
+            stage: "downloading",
+            downloaded: 0,
+            total: None,
+            message: "正在获取下载地址".into(),
+        },
+    );
+
+    let _permit = match slots.acquire().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            running.store(false, Ordering::Release);
+            emit_progress(
+                &app,
+                DownloadProgress {
+                    task_id: task_id.clone(),
+                    lesson_id: meta.lesson_id.clone(),
+                    lesson_title: meta.lesson_title.clone(),
+                    signal: meta.signal.clone(),
+                    file_name: String::new(),
+                    stage: "failed",
+                    downloaded: 0,
+                    total: None,
+                    message: error.to_string(),
+                },
+            );
+            return;
+        }
+    };
+
+    let result: Result<(), String> = async {
+        let client = http_client(jar)?;
+        let detail = fetch_video_detail(&client, &meta.session, &meta.lesson_id).await?;
+        let track = detail
+            .video_play_response_vo_list
+            .iter()
+            .find(|track| track.cdvi_view_num == meta.cdvi_view_num)
+            .ok_or_else(|| format!("讲次中找不到 {} 分轨", meta.signal))?;
+        let request = DownloadRequest {
+            lesson_id: meta.lesson_id.clone(),
+            lesson_title: meta.lesson_title.clone(),
+            begin_time: meta.begin_time.clone(),
+            signals: vec![meta.signal.clone()],
+            output_dir: Some(
+                meta.output_dir
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        };
+        let context = DownloadTaskContext {
+            task_id: task_id.clone(),
+            lesson_title: meta.lesson_title.clone(),
+            signal: meta.signal.clone(),
+            control,
+        };
+        download_track(
+            &app,
+            &client,
+            &request,
+            track,
+            &meta.output_dir,
+            &context,
+        )
+        .await
+    }
+    .await;
+
+    running.store(false, Ordering::Release);
+
+    if let Err(message) = result {
+        if app
+            .state::<AppState>()
+            .get_download(&task_id)
+            .map(|(_, control, _, _)| control.is_cancelled())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let stage = if message == "下载已取消" {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        emit_progress(
+            &app,
+            DownloadProgress {
+                task_id,
+                lesson_id: meta.lesson_id,
+                lesson_title: meta.lesson_title,
+                signal: meta.signal,
+                file_name: String::new(),
+                stage,
+                downloaded: 0,
+                total: None,
+                message,
+            },
+        );
+    }
 }
 
 #[tauri::command]
@@ -844,91 +1148,156 @@ async fn start_download(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     request: DownloadRequest,
-) -> Result<String, String> {
+) -> Result<Vec<String>, String> {
     let session = state
         .session
         .lock()
         .map_err(|_| "视频会话不可用")?
         .clone()
         .ok_or_else(|| "请先选择课程并读取讲次".to_string())?;
+    let jar = state.cookie_jar()?;
+    let client = http_client(jar.clone())?;
+    let directory = request
+        .output_dir
+        .as_ref()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::download_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("Canvas Pocket")
+        });
+    fs::create_dir_all(&directory)
+        .await
+        .map_err(|e| format!("无法创建保存目录：{e}"))?;
+    let detail = fetch_video_detail(&client, &session, &request.lesson_id).await?;
+    let wanted: HashSet<&str> = request.signals.iter().map(String::as_str).collect();
+    let matched: Vec<_> = detail
+        .video_play_response_vo_list
+        .iter()
+        .filter(|track| wanted.contains(track_name(track.cdvi_view_num)))
+        .collect();
+    if matched.is_empty() {
+        let available: Vec<_> = detail
+            .video_play_response_vo_list
+            .iter()
+            .map(|track| track_name(track.cdvi_view_num))
+            .collect();
+        return Err(format!(
+            "当前讲次没有所选分轨，可用分轨：{}",
+            if available.is_empty() {
+                "无".into()
+            } else {
+                available.join("、")
+            }
+        ));
+    }
+
+    let slots = state.download_slots.clone();
+    let mut task_ids = Vec::new();
+    for track in matched {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let signal = track_name(track.cdvi_view_num).to_string();
+        let control = TaskControl::new();
+        let progress = DownloadProgress {
+            task_id: task_id.clone(),
+            lesson_id: request.lesson_id.clone(),
+            lesson_title: request.lesson_title.clone(),
+            signal: signal.clone(),
+            file_name: String::new(),
+            stage: "queued",
+            downloaded: 0,
+            total: None,
+            message: "等待下载位置".into(),
+        };
+        state.register_download(
+            task_id.clone(),
+            ActiveDownload {
+                meta: DownloadTaskMeta {
+                    session: session.clone(),
+                    lesson_id: request.lesson_id.clone(),
+                    lesson_title: request.lesson_title.clone(),
+                    begin_time: request.begin_time.clone(),
+                    output_dir: directory.clone(),
+                    cdvi_view_num: track.cdvi_view_num,
+                    signal,
+                },
+                control: control.clone(),
+                progress: progress.clone(),
+                running: Arc::new(AtomicBool::new(false)),
+            },
+        )?;
+        emit_progress(&app, progress);
+        task_ids.push(task_id.clone());
+        let app_spawn = app.clone();
+        let slots_spawn = slots.clone();
+        let jar_spawn = jar.clone();
+        tauri::async_runtime::spawn(async move {
+            run_download_task(app_spawn, slots_spawn, jar_spawn, task_id).await;
+        });
+    }
+    Ok(task_ids)
+}
+
+#[tauri::command]
+fn list_download_tasks(state: tauri::State<'_, AppState>) -> Result<Vec<DownloadProgress>, String> {
+    let guard = state.downloads.lock().map_err(|_| "下载任务状态不可用")?;
+    let mut tasks: Vec<_> = guard.values().map(|task| task.progress.clone()).collect();
+    tasks.sort_by(|left, right| right.task_id.cmp(&left.task_id));
+    Ok(tasks)
+}
+
+#[tauri::command]
+fn pause_download(state: tauri::State<'_, AppState>, task_id: String) -> Result<(), String> {
+    let (_, control, progress, _) = state.get_download(&task_id)?;
+    if progress.stage == "completed" || progress.stage == "cancelled" {
+        return Err("该任务已结束，无法暂停".into());
+    }
+    control.pause();
+    Ok(())
+}
+
+#[tauri::command]
+async fn resume_download(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    task_id: String,
+) -> Result<(), String> {
+    let (meta, control, progress, running) = state.get_download(&task_id)?;
+    if progress.stage == "completed" {
+        return Err("该任务已完成".into());
+    }
+    if running.load(Ordering::Relaxed) {
+        control.resume();
+        return Ok(());
+    }
+    control.resume();
     let slots = state.download_slots.clone();
     let jar = state.cookie_jar()?;
-    let task_id = uuid::Uuid::new_v4().to_string();
-    let task_return = task_id.clone();
-    let task_app = app.clone();
+    emit_progress(
+        &app,
+        DownloadProgress {
+            task_id: task_id.clone(),
+            lesson_id: meta.lesson_id.clone(),
+            lesson_title: meta.lesson_title.clone(),
+            signal: meta.signal.clone(),
+            file_name: progress.file_name,
+            stage: "queued",
+            downloaded: progress.downloaded,
+            total: progress.total,
+            message: "准备继续下载".into(),
+        },
+    );
     tauri::async_runtime::spawn(async move {
-        emit_progress(
-            &task_app,
-            DownloadProgress {
-                task_id: task_id.clone(),
-                lesson_id: request.lesson_id.clone(),
-                file_name: request.lesson_title.clone(),
-                stage: "queued",
-                downloaded: 0,
-                total: None,
-                message: "等待下载位置".into(),
-            },
-        );
-        let _permit = match slots.acquire().await {
-            Ok(permit) => permit,
-            Err(error) => {
-                emit_progress(
-                    &task_app,
-                    DownloadProgress {
-                        task_id: task_id.clone(),
-                        lesson_id: request.lesson_id.clone(),
-                        file_name: request.lesson_title.clone(),
-                        stage: "failed",
-                        downloaded: 0,
-                        total: None,
-                        message: error.to_string(),
-                    },
-                );
-                return;
-            }
-        };
-        let result: Result<(), String> = async {
-            let directory = request
-                .output_dir
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    dirs::download_dir()
-                        .unwrap_or_else(|| PathBuf::from("."))
-                        .join("Canvas Pocket")
-                });
-            fs::create_dir_all(&directory)
-                .await
-                .map_err(|e| format!("无法创建保存目录：{e}"))?;
-            let client = http_client(jar)?;
-            let detail = fetch_video_detail(&client, &session, &request.lesson_id).await?;
-            let wanted: HashSet<&str> = request.signals.iter().map(String::as_str).collect();
-            for track in detail
-                .video_play_response_vo_list
-                .iter()
-                .filter(|track| wanted.contains(track_name(track.cdvi_view_num)))
-            {
-                download_track(&task_app, &client, &request, track, &directory, &task_id).await?;
-            }
-            Ok(())
-        }
-        .await;
-        if let Err(message) = result {
-            emit_progress(
-                &task_app,
-                DownloadProgress {
-                    task_id: task_id.clone(),
-                    lesson_id: request.lesson_id.clone(),
-                    file_name: request.lesson_title.clone(),
-                    stage: "failed",
-                    downloaded: 0,
-                    total: None,
-                    message,
-                },
-            );
-        }
+        run_download_task(app, slots, jar, task_id).await;
     });
-    Ok(task_return)
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_download(state: tauri::State<'_, AppState>, task_id: String) -> Result<(), String> {
+    let (_, control, _, _) = state.get_download(&task_id)?;
+    control.cancel();
+    Ok(())
 }
 
 #[tauri::command]
@@ -961,6 +1330,10 @@ pub fn run() {
             load_lessons,
             default_download_dir,
             start_download,
+            list_download_tasks,
+            pause_download,
+            resume_download,
+            cancel_download,
             logout
         ])
         .run(tauri::generate_context!())
