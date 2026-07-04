@@ -37,6 +37,8 @@ button { color: inherit; cursor: pointer; }
   display: grid;
   grid-template-columns: 240px 1fr;
   min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .sidebar {
@@ -49,6 +51,28 @@ button { color: inherit; cursor: pointer; }
   display: flex;
   flex-direction: column;
   z-index: 10;
+}
+
+.window-close {
+  position: absolute;
+  top: 14px;
+  right: 12px;
+  width: 28px;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-card);
+  color: var(--text-muted);
+  display: grid;
+  place-items: center;
+  padding: 0;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.window-close:hover {
+  color: var(--error-text);
+  background: var(--error-bg);
+  border-color: #f0d0cb;
 }
 
 .brand {
@@ -122,7 +146,11 @@ button { color: inherit; cursor: pointer; }
 .stage {
   grid-column: 2;
   min-width: 0;
-  padding: 32px 40px 64px;
+  height: 100vh;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  padding: 32px 40px 24px;
 }
 
 .page-header {
@@ -132,6 +160,15 @@ button { color: inherit; cursor: pointer; }
   gap: 16px;
   margin-bottom: 24px;
   max-width: 920px;
+  flex-shrink: 0;
+  cursor: default;
+  user-select: none;
+}
+
+.page-header button,
+.page-header input {
+  cursor: pointer;
+  user-select: auto;
 }
 
 .page-title {
@@ -177,6 +214,14 @@ button { color: inherit; cursor: pointer; }
 
 .page-body {
   max-width: 920px;
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.page-body-fill {
+  max-width: none;
 }
 
 .alert {
@@ -303,24 +348,97 @@ button { color: inherit; cursor: pointer; }
   accent-color: var(--accent);
 }
 
+.login-screen {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  min-height: 0;
+  padding: 12px 0 24px;
+  background:
+    radial-gradient(ellipse 80% 60% at 20% 20%, rgba(217, 119, 87, 0.08), transparent 55%),
+    radial-gradient(ellipse 70% 50% at 85% 75%, rgba(217, 119, 87, 0.05), transparent 50%);
+}
+
 .login-card {
-  max-width: 400px;
-  margin: 0 auto;
+  width: min(760px, 100%);
+  text-align: left;
+}
+
+.login-grid {
+  display: grid;
+  grid-template-columns: 1fr 280px;
+  gap: 36px;
+  padding: 36px 40px;
+  align-items: center;
+}
+
+.brand-icon-lg {
+  width: 44px;
+  height: 44px;
+  border-radius: 12px;
+  font-size: 18px;
+  margin-bottom: 20px;
+}
+
+.login-title {
+  margin: 0 0 8px;
+  font-family: "Source Serif 4", Georgia, serif;
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+}
+
+.login-lead {
+  margin: 0 0 24px;
+  font-size: 14px;
+  color: var(--text-secondary);
+}
+
+.login-steps {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--text-muted);
+  font-size: 13px;
+  line-height: 1.9;
+}
+
+.login-qr {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+.login-status {
+  margin: 14px 0 0;
+  font-size: 13px;
+  color: var(--text-secondary);
   text-align: center;
 }
 
-.login-card .card-body { padding: 32px 28px; }
+.login-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+
+.header-actions-inline {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
 
 .qr-frame {
   width: 220px;
   height: 220px;
-  margin: 0 auto 24px;
   border-radius: var(--radius);
   border: 1px solid var(--border);
   background: white;
   overflow: hidden;
   display: grid;
   place-items: center;
+  box-shadow: 0 4px 16px rgba(26, 25, 21, 0.06);
 }
 
 .qr-frame img {
@@ -331,9 +449,47 @@ button { color: inherit; cursor: pointer; }
 }
 
 .qr-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
   padding: 20px;
   color: var(--text-muted);
   font-size: 13px;
+  text-align: center;
+}
+
+.path-picker {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.path-value {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  background: var(--bg-input);
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.4;
+  word-break: break-all;
+  min-height: 40px;
+  display: flex;
+  align-items: center;
+}
+
+.page-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.brand[data-tauri-drag-region] {
+  cursor: default;
+  user-select: none;
 }
 
 .list {
@@ -410,9 +566,26 @@ button { color: inherit; cursor: pointer; }
 
 .lesson-grid {
   display: grid;
-  grid-template-columns: 1fr 272px;
+  grid-template-columns: minmax(0, 1fr) 280px;
   gap: 20px;
-  align-items: start;
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+  align-items: stretch;
+}
+
+.lesson-scroll {
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.side-card {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  max-height: 100%;
+  overflow-y: auto;
 }
 
 .side-card .card-body { padding: 18px; }
@@ -433,6 +606,54 @@ button { color: inherit; cursor: pointer; }
 }
 
 .task-list { display: grid; gap: 12px; }
+
+.download-summary {
+  margin-bottom: 16px;
+  padding: 18px 20px;
+}
+
+.download-summary-top {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 12px;
+}
+
+.download-summary-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.download-summary-percent {
+  font-family: "Source Serif 4", Georgia, serif;
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: -0.03em;
+  color: var(--text);
+}
+
+.download-summary-speed {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--accent-hover);
+  font-variant-numeric: tabular-nums;
+}
+
+.download-summary-meta {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.progress-lg {
+  height: 8px;
+}
 
 .task-card {
   padding: 16px 18px;
@@ -527,6 +748,9 @@ button { color: inherit; cursor: pointer; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 980px) {
+  .login-grid { grid-template-columns: 1fr; gap: 28px; padding: 28px 24px; }
   .lesson-grid { grid-template-columns: 1fr; }
-  .stage { padding: 24px 20px 48px; }
+  .side-card { position: static; }
+  .stage { padding: 24px 20px 20px; height: auto; min-height: 100vh; overflow: auto; }
+  .shell { height: auto; overflow: auto; }
 }

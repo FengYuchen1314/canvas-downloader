@@ -19,7 +19,8 @@
         "minWidth": 980,
         "minHeight": 680,
         "center": true,
-        "resizable": true
+        "resizable": true,
+        "decorations": false
       }
     ],
     "security": {
@@ -27,7 +28,18 @@
     }
   },
   "bundle": {
-    "active": false
+    "active": true,
+    "targets": ["deb", "rpm", "dmg", "nsis"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "shortDescription": "Canvas@SJTU 课程录像下载",
+    "longDescription": "上海交通大学 Canvas 课程课堂录像下载工具",
+    "category": "Utility"
   }
 }
 

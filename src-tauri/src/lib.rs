@@ -1533,6 +1533,7 @@ async fn logout(state: tauri::State<'_, AppState>) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(AppState::new())
         .setup(|app| {
             if let Some(main) = app.get_webview_window("main") {

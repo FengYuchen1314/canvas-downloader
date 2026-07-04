@@ -3,6 +3,11 @@
   "identifier": "default",
   "description": "Main application permissions",
   "windows": ["main"],
-  "permissions": ["core:default"]
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-close"
+  ]
 }
 

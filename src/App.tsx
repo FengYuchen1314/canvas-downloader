@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { open } from "@tauri-apps/plugin-dialog";
 import type {
   AuthStatus,
   Course,
@@ -17,6 +19,11 @@ const formatBytes = (value: number) => {
   const units = ["B", "KB", "MB", "GB"];
   const index = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1);
   return `${(value / 1024 ** index).toFixed(index > 1 ? 1 : 0)} ${units[index]}`;
+};
+
+const formatSpeed = (bytesPerSecond: number) => {
+  if (bytesPerSecond <= 0) return "0 B/s";
+  return `${formatBytes(bytesPerSecond)}/s`;
 };
 
 const stageLabel = (stage: DownloadStage) => {
@@ -64,6 +71,12 @@ const enrollmentLabel = (course: Course) => {
   }
 };
 
+const displayPath = (path: string) => {
+  if (!path.trim()) return "未选择目录";
+  if (path.length <= 52) return path;
+  return `…${path.slice(-49)}`;
+};
+
 function App() {
   const [screen, setScreen] = useState<Screen>("welcome");
   const [auth, setAuth] = useState<AuthStatus>({ phase: "idle", message: "未登录" });
@@ -80,6 +93,11 @@ function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [tasks, setTasks] = useState<Record<string, DownloadProgress>>({});
+  const [downloadSpeed, setDownloadSpeed] = useState(0);
+  const speedSampleRef = useRef<{ taskBytes: Record<string, number>; at: number }>({
+    taskBytes: {},
+    at: Date.now(),
+  });
 
   const refreshTasks = async () => {
     try {
@@ -117,6 +135,37 @@ function App() {
     };
   }, []);
 
+  useEffect(() => {
+    const now = Date.now();
+    const prev = speedSampleRef.current;
+    let delta = 0;
+    const nextBytes: Record<string, number> = {};
+
+    for (const task of Object.values(tasks)) {
+      if (task.stage !== "downloading") continue;
+      const previous = prev.taskBytes[task.taskId];
+      if (previous !== undefined && task.downloaded >= previous) {
+        delta += task.downloaded - previous;
+      }
+      nextBytes[task.taskId] = task.downloaded;
+    }
+
+    const elapsed = (now - prev.at) / 1000;
+    if (elapsed >= 0.2 && delta > 0) {
+      setDownloadSpeed(delta / elapsed);
+      speedSampleRef.current = { taskBytes: nextBytes, at: now };
+    } else {
+      speedSampleRef.current = { taskBytes: nextBytes, at: prev.at };
+    }
+  }, [tasks]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      if (Date.now() - speedSampleRef.current.at > 2000) setDownloadSpeed(0);
+    }, 500);
+    return () => window.clearInterval(timer);
+  }, []);
+
   const refreshCourses = async () => {
     setBusy(true);
     setError("");
@@ -143,10 +192,30 @@ function App() {
     }
   };
 
+  useEffect(() => {
+    if (screen !== "welcome" || auth.phase !== "idle") return;
+    void openLogin();
+  }, [screen, auth.phase]);
+
   const refreshQrCode = async () => {
     setError("");
     try {
       await invoke("refresh_qr_code");
+    } catch (reason) {
+      setError(String(reason));
+    }
+  };
+
+  const pickOutputDir = async () => {
+    setError("");
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        defaultPath: outputDir.trim() || undefined,
+        title: "选择保存目录",
+      });
+      if (typeof selected === "string") setOutputDir(selected);
     } catch (reason) {
       setError(String(reason));
     }
@@ -279,7 +348,38 @@ function App() {
     setScreen("welcome");
   };
 
+  const closeApp = () => {
+    void getCurrentWindow().close();
+  };
+
   const activeTasks = Object.values(tasks).sort((a, b) => b.taskId.localeCompare(a.taskId));
+
+  const downloadSummary = useMemo(() => {
+    const list = activeTasks.filter((task) => task.stage !== "cancelled");
+    let downloaded = 0;
+    let total = 0;
+    let knownTotal = true;
+    let downloading = 0;
+    let completed = 0;
+    let queued = 0;
+
+    for (const task of list) {
+      downloaded += task.downloaded;
+      if (task.total) {
+        total += task.total;
+      } else if (task.stage === "completed") {
+        total += task.downloaded;
+      } else {
+        knownTotal = false;
+      }
+      if (task.stage === "downloading") downloading += 1;
+      else if (task.stage === "completed") completed += 1;
+      else if (task.stage === "queued") queued += 1;
+    }
+
+    const percent = knownTotal && total > 0 ? Math.min(100, (downloaded / total) * 100) : null;
+    return { downloaded, total, percent, downloading, completed, queued, totalTasks: list.length, knownTotal };
+  }, [activeTasks]);
 
   const pageTitle =
     screen === "welcome"
@@ -293,7 +393,12 @@ function App() {
   return (
     <main className="shell">
       <aside className="sidebar">
-        <div className="brand">
+        <button type="button" className="window-close" onClick={closeApp} aria-label="关闭">
+          <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden>
+            <path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" />
+          </svg>
+        </button>
+        <div className="brand" data-tauri-drag-region>
           <div className="brand-icon" aria-hidden>✦</div>
           <div className="brand-text">Canvas 下载</div>
         </div>
@@ -305,7 +410,7 @@ function App() {
             type="button"
             className={screen === "courses" || screen === "lessons" ? "nav-link active" : "nav-link"}
             disabled={!courses.length}
-            onClick={() => setScreen(course ? "lessons" : "courses")}
+            onClick={() => setScreen("courses")}
           >
             课程
           </button>
@@ -317,7 +422,7 @@ function App() {
       </aside>
 
       <div className="stage">
-        <header className="page-header">
+        <header className="page-header" data-tauri-drag-region>
           <div>
             {screen === "lessons" && course && (
               <div className="crumb">
@@ -333,8 +438,17 @@ function App() {
             {screen === "lessons" && (
               <p className="page-sub">已选 {selected.size} 讲</p>
             )}
+            {screen === "downloads" && downloadSummary.totalTasks > 0 && (
+              <p className="page-sub">
+                {downloadSummary.completed}/{downloadSummary.totalTasks} 已完成
+                {downloadSummary.downloading > 0 && ` · ${downloadSummary.downloading} 个下载中`}
+              </p>
+            )}
           </div>
           <div className="header-actions">
+            {screen === "lessons" && (
+              <button type="button" className="btn" onClick={() => setScreen("courses")}>返回课程</button>
+            )}
             {auth.phase === "authorized" && (
               <button type="button" className="btn-ghost" onClick={logout}>退出</button>
             )}
@@ -349,119 +463,139 @@ function App() {
 
         {error && <div className="alert page-body">{error}</div>}
 
-        <div className="page-body">
+        <div className={screen === "lessons" ? "page-body page-body-fill" : "page-body"}>
           {screen === "welcome" && (
-            <section className="card login-card">
-              <div className="card-body">
-                <div className="qr-frame">
-                  {qrImage ? (
-                    <img src={`data:image/png;base64,${qrImage}`} alt="扫码登录" onClick={refreshQrCode} />
-                  ) : (
-                    <div className="qr-empty">
-                      {auth.phase === "qr-login" ? "加载中…" : "交我办扫码"}
+            <section className="login-screen">
+              <div className="card login-card">
+                <div className="login-grid">
+                  <div className="login-copy">
+                    <div className="brand-icon brand-icon-lg" aria-hidden>✦</div>
+                    <h2 className="login-title">Canvas 下载</h2>
+                    <p className="login-lead">上海交通大学 · 交我办扫码登录</p>
+                    <ol className="login-steps">
+                      <li>扫码登录 Canvas</li>
+                      <li>选择课程与讲次</li>
+                      <li>下载课堂录像</li>
+                    </ol>
+                  </div>
+                  <div className="login-qr">
+                    <div className="qr-frame">
+                      {qrImage ? (
+                        <img src={`data:image/png;base64,${qrImage}`} alt="扫码登录" onClick={refreshQrCode} />
+                      ) : (
+                        <div className="qr-empty">
+                          <div className="spinner" />
+                          <span>{auth.phase === "error" ? "加载失败" : "正在获取二维码"}</span>
+                        </div>
+                      )}
                     </div>
-                  )}
+                    <p className="login-status">{auth.message}</p>
+                    <div className="login-actions">
+                      <button type="button" className="btn btn-accent" onClick={openLogin}>
+                        {auth.phase === "qr-login" ? "刷新二维码" : "重新登录"}
+                      </button>
+                      {auth.phase === "authorized" && (
+                        <button type="button" className="btn" onClick={refreshCourses}>进入课程</button>
+                      )}
+                    </div>
+                  </div>
                 </div>
-                <button type="button" className="btn btn-accent" onClick={openLogin}>
-                  {auth.phase === "qr-login" ? "刷新二维码" : "登录"}
-                </button>
-                {auth.phase === "authorized" && (
-                  <button type="button" className="btn-ghost" onClick={refreshCourses} style={{ marginTop: 12 }}>
-                    进入课程
-                  </button>
-                )}
               </div>
             </section>
           )}
 
           {screen === "courses" && (
-            <section className="card">
-              <div className="card-body">
-                <div className="toolbar">
-                  <input
-                    className="input input-search"
-                    value={courseQuery}
-                    onChange={(event) => setCourseQuery(event.target.value)}
-                    placeholder="搜索课程"
-                  />
-                </div>
-                {visibleCourses.length ? (
-                  <div className="list">
-                    {visibleCourses.map((item) => (
-                      <button type="button" className="list-item" key={item.id} onClick={() => chooseCourse(item)}>
-                        <div className="list-item-main">
-                          <strong>{shortCourseName(item.name)}</strong>
-                          <span>{item.courseCode || "—"} · {formatCourseDate(item)}</span>
-                        </div>
-                        <span className={item.enrollmentState === "active" ? "chip live" : "chip"}>
-                          {enrollmentLabel(item)}
-                        </span>
-                      </button>
-                    ))}
+            <section className="page-scroll">
+              <div className="card">
+                <div className="card-body">
+                  <div className="toolbar">
+                    <input
+                      className="input input-search"
+                      value={courseQuery}
+                      onChange={(event) => setCourseQuery(event.target.value)}
+                      placeholder="搜索课程"
+                    />
                   </div>
-                ) : (
-                  <div className="empty">{courses.length ? "无匹配课程" : "暂无课程"}</div>
-                )}
+                  {visibleCourses.length ? (
+                    <div className="list">
+                      {visibleCourses.map((item) => (
+                        <button type="button" className="list-item" key={item.id} onClick={() => chooseCourse(item)}>
+                          <div className="list-item-main">
+                            <strong>{shortCourseName(item.name)}</strong>
+                            <span>{item.courseCode || "—"} · {formatCourseDate(item)}</span>
+                          </div>
+                          <span className={item.enrollmentState === "active" ? "chip live" : "chip"}>
+                            {enrollmentLabel(item)}
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="empty">{courses.length ? "无匹配课程" : "暂无课程"}</div>
+                  )}
+                </div>
               </div>
             </section>
           )}
 
           {screen === "lessons" && (
             <section className="lesson-grid">
-              <div className="card">
-                <div className="card-header">
-                  <h2>讲次</h2>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <button
-                      type="button"
-                      className="btn"
-                      onClick={() => setSelected(new Set(visibleLessons.map((lesson) => lesson.videoId)))}
-                    >
-                      全选
-                    </button>
-                    <button type="button" className="btn" onClick={() => setSelected(new Set())}>清空</button>
+              <div className="lesson-scroll">
+                <div className="card">
+                  <div className="card-header">
+                    <h2>讲次</h2>
+                    <div className="header-actions-inline">
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => setSelected(new Set(visibleLessons.map((lesson) => lesson.videoId)))}
+                      >
+                        全选
+                      </button>
+                      <button type="button" className="btn" onClick={() => setSelected(new Set())}>清空</button>
+                    </div>
                   </div>
-                </div>
-                <div className="card-body">
-                  <div className="toolbar">
-                    <input
-                      className="input input-search"
-                      value={query}
-                      onChange={(event) => setQuery(event.target.value)}
-                      placeholder="搜索讲次"
-                    />
-                  </div>
-                  {visibleLessons.length ? (
-                    <div className="list">
-                      {visibleLessons.map((lesson) => (
-                        <div
-                          key={lesson.videoId}
-                          className={selected.has(lesson.videoId) ? "list-item selected" : "list-item"}
-                          onClick={() => toggleLesson(lesson.videoId)}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter" || event.key === " ") toggleLesson(lesson.videoId);
-                          }}
-                          role="button"
-                          tabIndex={0}
-                        >
-                          <div className="list-item-check">
-                            <input
-                              type="checkbox"
-                              checked={selected.has(lesson.videoId)}
-                              onChange={() => toggleLesson(lesson.videoId)}
-                              onClick={(event) => event.stopPropagation()}
-                            />
-                            <div className="list-item-main">
-                              <strong>{lesson.title}</strong>
-                              <span>{lesson.beginTime} · {lesson.classroom || "—"}</span>
+                  <div className="card-body">
+                    <div className="toolbar">
+                      <input
+                        className="input input-search"
+                        value={query}
+                        onChange={(event) => setQuery(event.target.value)}
+                        placeholder="搜索讲次"
+                      />
+                    </div>
+                    {visibleLessons.length ? (
+                      <div className="list">
+                        {visibleLessons.map((lesson) => (
+                          <div
+                            key={lesson.videoId}
+                            className={selected.has(lesson.videoId) ? "list-item selected" : "list-item"}
+                            onClick={() => toggleLesson(lesson.videoId)}
+                            onKeyDown={(event) => {
+                              if (event.key === "Enter" || event.key === " ") toggleLesson(lesson.videoId);
+                            }}
+                            role="button"
+                            tabIndex={0}
+                          >
+                            <div className="list-item-check">
+                              <input
+                                type="checkbox"
+                                checked={selected.has(lesson.videoId)}
+                                onChange={() => toggleLesson(lesson.videoId)}
+                                onClick={(event) => event.stopPropagation()}
+                              />
+                              <div className="list-item-main">
+                                <strong>{lesson.title}</strong>
+                                <span>{lesson.beginTime} · {lesson.classroom || "—"}</span>
+                              </div>
                             </div>
                           </div>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="empty">暂无开放讲次</div>
-                  )}
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="empty">暂无开放讲次</div>
+                    )}
+                  </div>
                 </div>
               </div>
 
@@ -482,10 +616,13 @@ function App() {
                       ))}
                     </div>
                   </div>
-                  <label className="field">
+                  <div className="field">
                     <span>保存目录</span>
-                    <input className="input" value={outputDir} onChange={(event) => setOutputDir(event.target.value)} />
-                  </label>
+                    <div className="path-picker">
+                      <div className="path-value" title={outputDir}>{displayPath(outputDir)}</div>
+                      <button type="button" className="btn" onClick={() => void pickOutputDir()}>选择</button>
+                    </div>
+                  </div>
                   <label className="field">
                     <span>并发</span>
                     <input
@@ -512,9 +649,45 @@ function App() {
           )}
 
           {screen === "downloads" && (
-            <section>
+            <section className="page-scroll">
               {activeTasks.length ? (
-                <div className="task-list">
+                <>
+                  <div className="download-summary card">
+                    <div className="download-summary-top">
+                      <div>
+                        <span className="download-summary-label">总进度</span>
+                        <strong className="download-summary-percent">
+                          {downloadSummary.percent !== null
+                            ? `${Math.round(downloadSummary.percent)}%`
+                            : "—"}
+                        </strong>
+                      </div>
+                      <div className="download-summary-speed">{formatSpeed(downloadSpeed)}</div>
+                    </div>
+                    <div className="progress progress-lg">
+                      <i
+                        style={{
+                          width: `${downloadSummary.percent ?? (downloadSummary.downloaded > 0 ? 8 : 0)}%`,
+                        }}
+                      />
+                    </div>
+                    <div className="download-summary-meta">
+                      <span>
+                        {formatBytes(downloadSummary.downloaded)}
+                        {downloadSummary.knownTotal && downloadSummary.total > 0
+                          ? ` / ${formatBytes(downloadSummary.total)}`
+                          : ""}
+                      </span>
+                      <span>
+                        {downloadSummary.downloading > 0
+                          ? `${downloadSummary.downloading} 个进行中`
+                          : downloadSummary.queued > 0
+                            ? `${downloadSummary.queued} 个排队中`
+                            : "全部完成"}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="task-list">
                   {activeTasks.map((task) => {
                     const percent = task.total
                       ? Math.min(100, (task.downloaded / task.total) * 100)
@@ -551,7 +724,8 @@ function App() {
                       </article>
                     );
                   })}
-                </div>
+                  </div>
+                </>
               ) : (
                 <div className="card"><div className="empty">暂无任务</div></div>
               )}

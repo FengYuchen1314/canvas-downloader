@@ -1,0 +1,126 @@
+name: Release
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            rust-target: x86_64-pc-windows-msvc
+            artifact: windows
+          - platform: macos-latest
+            rust-target: aarch64-apple-darwin
+            artifact: macos-aarch64
+          - platform: macos-latest
+            rust-target: x86_64-apple-darwin
+            artifact: macos-x86_64
+          - platform: ubuntu-22.04
+            rust-target: x86_64-unknown-linux-gnu
+            artifact: linux
+
+    runs-on: ${{ matrix.platform }}
+    name: build-${{ matrix.artifact }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            rpm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        run: npm run tauri build -- --target ${{ matrix.rust-target }}
+
+      - name: Upload Windows artifacts
+        if: matrix.artifact == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          if-no-files-found: error
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/canvas-downloader.exe
+
+      - name: Upload macOS artifacts
+        if: startsWith(matrix.artifact, 'macos-')
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          if-no-files-found: error
+          path: src-tauri/target/${{ matrix.rust-target }}/release/bundle/dmg/*.dmg
+
+      - name: Upload Linux artifacts
+        if: matrix.artifact == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          if-no-files-found: error
+          path: |
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+            src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        run: echo "version=$(jq -r .version src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: release-assets
+
+      - name: Publish GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          replaceArtifacts: true
+          artifactErrorsFailBuild: true
+          artifacts: release-assets/**
+          tag: v${{ steps.version.outputs.version }}
+          name: Canvas Pocket v${{ steps.version.outputs.version }}
+          commit: ${{ github.sha }}
+          generateReleaseNotes: true
+          token: ${{ secrets.GITHUB_TOKEN }}
